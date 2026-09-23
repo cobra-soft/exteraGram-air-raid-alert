@@ -1,0 +1,16 @@
+name = "old-art-1d92"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+kv_namespaces = [
+  { binding = "CACHE", id = "dd93d4c6a7c24110812e94dd8930206e" },
+  { binding = "USERS", id = "23d60800f794435b8596c28c62de177c" }
+]
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+ENVIRONMENT = "production"
