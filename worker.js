@@ -3,7 +3,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
-const WORKER_VERSION = "i18n-2026-09-24"; // shown in /health so you can verify which file is deployed
+const WORKER_VERSION = "i18n-admin-login-2026-09-24"; // shown in /health so you can verify which file is deployed
 const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
@@ -910,6 +910,391 @@ async function handleSetupWebhook(request, env) {
   return json({ ok: r.ok, webhook_url: target.toString(), telegram_response: body });
 }
 
+// ───────────────────────── ADMIN DASHBOARD (owner only) ─────────────────────────
+// Password = secret ADMIN_TOKEN. Open https://<worker>/admin and log in.
+// Without ADMIN_TOKEN the dashboard is disabled.
+function safeEqual(a, b) {
+  a = String(a || ""); b = String(b || "");
+  let d = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return d === 0;
+}
+// Session cookie = "<expiryMs>.<hmac>" signed with ADMIN_TOKEN. The password itself
+// is never stored in the browser; changing ADMIN_TOKEN logs every session out.
+const ADMIN_SESSION_SEC = 7 * 24 * 3600;
+const ADMIN_MAX_FAILS = 5;         // failed logins per IP ...
+const ADMIN_FAIL_WINDOW_SEC = 600; // ... per 10 minutes (best effort, Cache API)
+
+async function hmacHex(secret, msg) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(String(secret)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(msg)));
+  return Array.from(sig).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function makeSession(env, ttlSec) {
+  const exp = Date.now() + ttlSec * 1000;
+  return `${exp}.${await hmacHex(env.ADMIN_TOKEN, "adm:" + exp)}`;
+}
+async function isAdmin(request, env) {
+  if (!env.ADMIN_TOKEN) return false;
+  const h = request.headers.get("Authorization") || "";
+  if (h.startsWith("Bearer ") && safeEqual(h.slice(7), env.ADMIN_TOKEN)) return true; // curl / scripts
+  const m = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)adm=([^;]+)/);
+  if (!m) return false;
+  const dot = m[1].indexOf(".");
+  if (dot < 1) return false;
+  const exp = Number(m[1].slice(0, dot));
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  return safeEqual(m[1].slice(dot + 1), await hmacHex(env.ADMIN_TOKEN, "adm:" + exp));
+}
+async function failCount(ip) {
+  try {
+    const r = await caches.default.match(new Request(`https://admin-fail.internal/${encodeURIComponent(ip)}`));
+    return r ? Number(await r.text()) || 0 : 0;
+  } catch (e) { return 0; }
+}
+async function bumpFail(ip, n) {
+  try {
+    await caches.default.put(new Request(`https://admin-fail.internal/${encodeURIComponent(ip)}`),
+      new Response(String(n), { headers: { "Cache-Control": `max-age=${ADMIN_FAIL_WINDOW_SEC}` } }));
+  } catch (e) { /* best effort */ }
+}
+function loginPage(msg, status = 200) {
+  const html = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#141218"><title>Вход</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#141218;color:#e6e0e9;font:400 15px/22px Roboto,system-ui,sans-serif}
+form{background:#211f26;border-radius:28px;padding:28px;width:min(380px,calc(100% - 32px));display:grid;gap:16px}
+h1{margin:0;font:400 24px/32px Roboto,system-ui,sans-serif}p{margin:0;color:#cac4d0}.e{color:#f2b8b5}
+input{background:#2b2930;border:0;border-bottom:2px solid #938f99;border-radius:12px 12px 0 0;height:56px;padding:0 16px;color:#e6e0e9;font-size:16px;outline:0}
+input:focus{border-color:#d0bcff}button{height:48px;border:0;border-radius:24px;background:#d0bcff;color:#381e72;font:500 15px Roboto,system-ui,sans-serif;cursor:pointer}</style></head>
+<body><form method="post" action="/admin/login"><h1>Air Raid Worker</h1><p>Панель владельца. Введите пароль.</p>
+${msg ? `<p class="e">${msg}</p>` : ""}
+<input type="password" name="password" autocomplete="current-password" placeholder="Пароль" autofocus required><button type="submit">Войти</button></form></body></html>`;
+  return new Response(html, { status, headers: {
+    "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"
+  } });
+}
+async function handleLogin(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const fails = await failCount(ip);
+  if (fails >= ADMIN_MAX_FAILS) return loginPage("Слишком много попыток. Подождите 10 минут.", 429);
+  let pw = "";
+  try {
+    if ((request.headers.get("Content-Type") || "").includes("application/json")) pw = (await request.json()).password;
+    else pw = (await request.formData()).get("password");
+  } catch (e) { /* empty password */ }
+  if (!safeEqual(pw, env.ADMIN_TOKEN)) {
+    await bumpFail(ip, fails + 1);
+    await new Promise(r => setTimeout(r, 800)); // slow down guessing
+    return loginPage("Неверный пароль", 401);
+  }
+  const value = await makeSession(env, ADMIN_SESSION_SEC);
+  return new Response(null, { status: 302, headers: {
+    Location: "/admin", "Cache-Control": "no-store",
+    "Set-Cookie": `adm=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ADMIN_SESSION_SEC}`
+  } });
+}
+function adminJson(body, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+}
+
+async function collectUsers(env, data) {
+  const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
+  let cursor, pages = 0;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const it of page.keys || []) {
+      const u = it.metadata;
+      if (!u) continue;
+      st.total++;
+      if (u.notify === false) st.notifyOff++;
+      if (!u.oblast_key) { st.noRegion++; continue; }
+      const lang = normLang(u.lang);
+      st.byLang[lang] = (st.byLang[lang] || 0) + 1;
+      const known = u.last_alert_state || "clear";
+      st.byState[known] = (st.byState[known] || 0) + 1;
+      st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
+      if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
+    }
+    cursor = page.list_complete ? null : page.cursor;
+    if (cursor && ++pages >= 10) { st.truncated = true; break; }
+  } while (cursor);
+  st.byOblast = Object.entries(st.byOblast).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => ({ key: k, name: OBLAST_NAMES_UK[k] || k, n }));
+  return st;
+}
+
+async function adminData(env, request, full, kvTest) {
+  const out = {
+    version: WORKER_VERSION, time: new Date().toISOString(), langs: Object.keys(TEXTS),
+    bindings: { alertsKey: !!env.ALERTS_API_KEY, botToken: !!env.BOT_TOKEN, cache: !!env.CACHE, users: !!env.USERS },
+    regions: { o: OBLAST_NAMES_UK, d: DISTRICT_NAMES_UK },
+    config: { edgeTtl: EDGE_CACHE_TTL_SECONDS, cacheWriteIntervalSec: MIN_CACHE_WRITE_INTERVAL_SECONDS, retryWindowSec: RETRY_WINDOW_MS / 1000 }
+  };
+  const c = await readCache(env.CACHE);
+  out.snapshot = c ? {
+    fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
+    pendingRetry: c.pendingRetry || 0, signature: c.signature,
+    oblasts: c.data.oblasts, raions: c.data.raions
+  } : null;
+  try {
+    const u = new URL(request.url); u.pathname = "/api"; u.search = "";
+    out.edgeCache = !!(await caches.default.match(new Request(u.toString(), { method: "GET" })));
+  } catch (e) { out.edgeCache = null; }
+  if (!full) return out;
+
+  const timed = async (fn) => { const t = Date.now(); try { return { ok: true, ms: 0, ...(await fn()), _t: t }; } catch (e) { return { ok: false, error: String(e && e.message || e).slice(0, 300), _t: t }; } };
+  const [up, wh, users, kv] = await Promise.all([
+    timed(async () => { const d = await fetchUpstream(env); return { rawAlerts: (d.alerts || []).length, oblasts: d.oblasts.length, raions: d.raions.length, sameAsSnapshot: c ? c.signature === buildStatusSignature(d) : null }; }),
+    timed(async () => {
+      if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN not configured");
+      const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/getWebhookInfo`, {}, FETCH_TIMEOUT_MS);
+      const j = await r.json();
+      return { info: j.result || j };
+    }),
+    timed(async () => ({ stats: await collectUsers(env, c && c.data) })),
+    kvTest ? timed(async () => { await env.CACHE.put("health-check", String(Date.now()), { expirationTtl: 120 }); return {}; }) : Promise.resolve(null)
+  ]);
+  for (const x of [up, wh, users, kv]) if (x) { x.ms = Date.now() - x._t; delete x._t; }
+  out.upstream = up; out.webhook = wh; out.users = users; out.kvWrite = kv;
+  return out;
+}
+
+async function handleAdmin(request, env, url) {
+  const p = url.pathname;
+  if (!env.ADMIN_TOKEN) return new Response("Admin disabled: set the ADMIN_TOKEN secret", { status: 404 });
+
+  if (p === "/admin/login" && request.method === "POST") return await handleLogin(request, env);
+  if (p === "/admin/logout" && request.method === "POST") {
+    return new Response(JSON.stringify({ ok: true }), { headers: {
+      "Content-Type": "application/json", "Cache-Control": "no-store",
+      "Set-Cookie": "adm=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+    } });
+  }
+
+  if (!(await isAdmin(request, env))) {
+    if (p === "/admin") return loginPage("");
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  if (p === "/admin") return new Response(ADMIN_HTML, { headers: {
+    "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"
+  } });
+  if (p === "/admin/data") {
+    try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1")); }
+    catch (e) { return adminJson({ error: String(e) }, 500); }
+  }
+  if (p === "/admin/action" && request.method === "POST") {
+    const name = url.searchParams.get("name");
+    if (name === "setup-webhook") return await handleSetupWebhook(request, env);
+    if (name === "purge-edge") {
+      const u = new URL(request.url); u.pathname = "/api"; u.search = "";
+      return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
+    }
+    return adminJson({ error: "unknown action" }, 400);
+  }
+  return adminJson({ error: "not_found" }, 404);
+}
+
+const ADMIN_HTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#141218">
+<title>Air Raid Worker</title>
+<style>
+:root{--bg:#141218;--s1:#1d1b20;--s2:#211f26;--s3:#2b2930;--s4:#36343b;--tx:#e6e0e9;--tv:#cac4d0;--ol:#938f99;--olv:#49454f;
+--pr:#d0bcff;--onpr:#381e72;--prc:#4f378b;--onprc:#eaddff;--sec:#ccc2dc;--secc:#4a4458;--onsecc:#e8def8;--ter:#efb8c8;
+--err:#f2b8b5;--errc:#8c1d18;--ok:#a8dab5;--okc:#0f3d22;--warn:#ffd8a0;--warnc:#4a3200}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--tx);font:400 14px/20px Roboto,system-ui,-apple-system,"Segoe UI",sans-serif}
+.app{display:flex;min-height:100vh}
+.rail{width:88px;flex:none;position:sticky;top:0;height:100vh;background:var(--bg);display:flex;flex-direction:column;align-items:center;padding:20px 0;gap:14px;border-right:1px solid var(--olv)}
+.ni{display:flex;flex-direction:column;align-items:center;gap:4px;font:500 12px/16px inherit;color:var(--tv);border:0;background:none;cursor:pointer;width:80px;padding:0}
+.ni .pill{width:56px;height:32px;border-radius:16px;display:grid;place-items:center;transition:background .2s}
+.ni:hover .pill{background:var(--s3)}.ni.on{color:var(--tx)}.ni.on .pill{background:var(--secc);color:var(--onsecc)}
+.ni svg{width:24px;height:24px;fill:currentColor}
+.main{flex:1;min-width:0}
+.top{position:sticky;top:0;z-index:5;background:var(--bg);height:64px;display:flex;align-items:center;gap:12px;padding:0 16px}
+.top h1{margin:0;font:400 22px/28px inherit;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top small{display:block;font:400 12px/16px inherit;color:var(--tv)}
+.prog{height:4px;background:var(--s3);overflow:hidden;position:sticky;top:64px;z-index:5;opacity:0;transition:opacity .2s}
+.prog.on{opacity:1}.prog i{display:block;height:100%;width:40%;background:var(--pr);border-radius:2px;animation:ind 1.1s infinite ease-in-out}
+@keyframes ind{0%{margin-left:-40%}100%{margin-left:100%}}
+.ib{width:40px;height:40px;border-radius:20px;border:0;background:none;color:var(--tv);display:grid;place-items:center;cursor:pointer}
+.ib:hover{background:var(--s3)}.ib svg{width:24px;height:24px;fill:currentColor}
+.sw{display:flex;align-items:center;gap:8px;color:var(--tv);font-size:12px;cursor:pointer}
+.sw i{width:52px;height:32px;border-radius:16px;border:2px solid var(--ol);background:var(--s3);position:relative;transition:.2s}
+.sw i:after{content:"";position:absolute;top:6px;left:6px;width:16px;height:16px;border-radius:50%;background:var(--ol);transition:.2s}
+.sw.on i{background:var(--pr);border-color:var(--pr)}.sw.on i:after{left:26px;top:2px;width:24px;height:24px;background:var(--onpr);top:2px}
+.view{padding:8px 16px 120px;max-width:1000px;margin:0 auto;display:grid;gap:12px}
+.card{background:var(--s2);border-radius:16px;padding:16px}
+.card h2{margin:0 0 8px;font:500 14px/20px inherit;color:var(--pr);letter-spacing:.1px}
+.hero{border-radius:28px;padding:24px;display:flex;gap:16px;align-items:center}
+.hero.ok{background:var(--prc);color:var(--onprc)}.hero.warn{background:var(--warnc);color:var(--warn)}.hero.bad{background:var(--errc);color:var(--err)}
+.hero .ic{width:56px;height:56px;border-radius:28px;background:rgba(255,255,255,.12);display:grid;place-items:center;font-size:28px;flex:none}
+.hero b{display:block;font:400 24px/32px inherit}.hero span{opacity:.85}
+.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.m{background:var(--s2);border-radius:16px;padding:16px}.m .v{font:400 32px/40px inherit;color:var(--tx)}.m .l{color:var(--tv);font-size:12px}
+.m.hl{background:var(--secc)}.m.hl .v{color:var(--onsecc)}
+.li{display:flex;align-items:center;gap:16px;padding:10px 0;border-bottom:1px solid var(--olv);cursor:default}
+.li:last-child{border:0}.li .av{width:40px;height:40px;border-radius:20px;background:var(--secc);color:var(--onsecc);display:grid;place-items:center;flex:none;font-size:18px}
+.li .av.ok{background:var(--okc);color:var(--ok)}.li .av.warn{background:var(--warnc);color:var(--warn)}.li .av.bad{background:var(--errc);color:var(--err)}
+.li .t{flex:1;min-width:0}.li .t b{display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis}.li .t span{color:var(--tv);font-size:12px;word-break:break-word}
+.li .e{color:var(--tv);font-size:12px;text-align:right;white-space:nowrap}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--olv)}.kv:last-child{border:0}
+.kv span:first-child{color:var(--tv)}.kv span:last-child{text-align:right;word-break:break-word}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--err)}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{height:32px;padding:0 14px;border-radius:8px;border:1px solid var(--ol);background:none;color:var(--tv);font:500 13px inherit;cursor:pointer}
+.chip.on{background:var(--secc);color:var(--onsecc);border-color:transparent}
+.field{background:var(--s3);border-radius:28px;height:48px;display:flex;align-items:center;padding:0 16px;gap:12px}
+.field input{flex:1;background:none;border:0;outline:0;color:var(--tx);font:inherit;font-size:16px}
+.btn{height:40px;padding:0 24px;border-radius:20px;border:0;font:500 14px inherit;cursor:pointer;background:var(--secc);color:var(--onsecc)}
+.btn:hover{filter:brightness(1.15)}.btn.f{background:var(--pr);color:var(--onpr)}.btn.o{background:none;border:1px solid var(--ol);color:var(--pr)}.btn.t{background:none;color:var(--pr);padding:0 12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row .field{min-width:0}
+.bar{height:8px;border-radius:4px;background:var(--s3);overflow:hidden;margin-top:4px}.bar i{display:block;height:100%;background:var(--pr);border-radius:4px}
+.bl{display:flex;justify-content:space-between;margin-top:10px;font-size:13px}
+.tag{padding:2px 10px;border-radius:8px;font-size:12px;font-weight:500}.tag.red{background:var(--errc);color:var(--err)}.tag.yellow{background:var(--warnc);color:var(--warn)}
+.empty{text-align:center;color:var(--tv);padding:32px 8px}.empty .big{font-size:40px}
+pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospace,Menlo,monospace;color:var(--tv);max-height:360px;overflow:auto}
+.fab{position:fixed;right:16px;bottom:24px;height:56px;padding:0 20px 0 16px;border-radius:16px;border:0;background:var(--prc);color:var(--onprc);font:500 14px inherit;display:flex;align-items:center;gap:12px;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.5);z-index:6}
+.fab svg{width:24px;height:24px;fill:currentColor}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;place-items:center;z-index:20}.scrim.on{display:grid}
+.dlg{background:var(--s3);border-radius:28px;padding:24px;width:min(360px,calc(100% - 32px))}.dlg h3{margin:0 0 16px;font:400 24px/32px inherit}.dlg p{margin:0 0 24px;color:var(--tv)}.dlg .row{justify-content:flex-end}
+.snack{position:fixed;left:50%;transform:translate(-50%,120px);bottom:96px;background:#e6e0e9;color:#322f35;padding:14px 16px;border-radius:4px;max-width:calc(100% - 32px);z-index:30;transition:transform .25s}.snack.on{transform:translate(-50%,0)}
+.tag.green{background:var(--okc);color:var(--ok)}
+.sh{margin:14px 0 2px;font:500 12px/16px inherit;color:var(--tv);letter-spacing:.5px;text-transform:uppercase}
+.menu{display:none;position:absolute;right:0;top:44px;background:var(--s3);border-radius:12px;padding:8px 0;min-width:280px;box-shadow:0 4px 16px rgba(0,0,0,.6);z-index:15}.menu.on{display:block}
+.mi{display:flex;gap:12px;padding:12px 16px;cursor:pointer}.mi:hover{background:var(--s4)}.mi span{width:16px;color:var(--pr)}.mi.on{color:var(--pr)}
+@media(max-width:600px){.menu{position:fixed;left:16px;right:16px;top:auto;bottom:100px;min-width:0}}
+@media(min-width:840px){.metrics{grid-template-columns:repeat(4,1fr)}.fab{bottom:24px}.snack{bottom:24px}}
+@media(max-width:839px){.rail{position:fixed;bottom:0;left:0;right:0;top:auto;width:100%;height:80px;flex-direction:row;justify-content:space-around;padding:12px 0 calc(12px + env(safe-area-inset-bottom,0px));background:var(--s2);border:0;z-index:10;height:auto}
+.fab{bottom:96px;right:16px}.snack{bottom:170px}.sw b{display:none}}
+</style></head><body>
+<div class="app">
+<nav class="rail" id="nav"></nav>
+<div class="main">
+<header class="top"><h1>Air Raid Worker<small id="sub"></small></h1>
+<div class="sw on" id="auto" title="Автообновление 30с"><b>Авто</b><i></i></div>
+<button class="ib" id="rf" title="Обновить"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button><button class="ib" id="lo" title="Выйти"><svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button></header>
+<div class="prog" id="prog"><i></i></div>
+<main class="view" id="view"></main>
+</div></div>
+<button class="fab" id="fab"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>Полная проверка</button>
+<div class="scrim" id="scrim"><div class="dlg"><h3 id="dt"></h3><p id="dp"></p><div class="row"><button class="btn t" id="dn">Отмена</button><button class="btn f" id="dy">Выполнить</button></div></div></div>
+<div class="snack" id="snack"></div>
+<script>
+var TZ="Europe/Kyiv",S={tab:"ov",d:null,f:{},flt:"all",sort:"lvl",q:"",auto:true,busy:0};
+var IC={ov:"M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z",al:"M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4a1.5 1.5 0 0 0-3 0v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z",us:"M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z",sy:"M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.5.5 0 0 0 .12-.61l-1.92-3.32a.5.5 0 0 0-.59-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.48-.41h-3.84a.5.5 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.59.22L2.74 8.87a.5.5 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.5.5 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"};
+var TABS=[["ov","Обзор"],["al","Тревоги"],["us","Юзеры"],["sy","Система"]];
+function $(i){return document.getElementById(i)}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function tm(x){return x?new Date(x).toLocaleTimeString("ru-RU",{timeZone:TZ,hour:"2-digit",minute:"2-digit"}):"—"}
+function dtm(x){return x?new Date(x).toLocaleString("ru-RU",{timeZone:TZ}):"—"}
+function age(s){if(s==null)return"—";if(s<90)return s+" с";if(s<5400)return Math.round(s/60)+" мин";return(s/3600).toFixed(1)+" ч"}
+function dur(x){if(!x)return"—";var m=Math.max(0,Math.round((Date.now()-new Date(x))/60000));return m<60?m+" мин":Math.floor(m/60)+" ч "+(m%60)+" мин"}
+function kv(k,v,c){return'<div class="kv"><span>'+esc(k)+'</span><span class="'+(c||"")+'">'+(v==null||v===""?"—":esc(v))+'</span></div>'}
+function li(ic,cls,t,s,e,go){return'<div class="li"'+(go?' style="cursor:pointer" onclick="tab(\\''+go+'\\')"':'')+'><div class="av '+cls+'">'+ic+'</div><div class="t"><b>'+esc(t)+'</b><span>'+esc(s)+'</span></div><div class="e">'+(e||"")+'</div></div>'}
+function card(t,b){return'<div class="card"><h2>'+esc(t)+'</h2>'+b+'</div>'}
+function nav(){$("nav").innerHTML=TABS.map(function(t){return'<button class="ni'+(S.tab===t[0]?" on":"")+'" onclick="tab(\\''+t[0]+'\\')"><div class="pill"><svg viewBox="0 0 24 24"><path d="'+IC[t[0]]+'"/></svg></div>'+t[1]+'</button>'}).join("")}
+function tab(t){S.tab=t;nav();draw();scrollTo(0,0)}
+function health(){var d=S.d,f=S.f,is=[],lvl="ok";
+ function bad(m){is.push(m);lvl="bad"}function wr(m){is.push(m);if(lvl!=="bad")lvl="warn"}
+ if(!d.bindings.alertsKey)bad("Нет ALERTS_API_KEY");if(!d.bindings.botToken)bad("Нет BOT_TOKEN");
+ if(!d.snapshot)bad("Нет снапшота");else if(d.snapshot.ageSeconds>2100)bad("Снапшот устарел ("+age(d.snapshot.ageSeconds)+")");
+ if(d.snapshot&&d.snapshot.pendingRetry)wr("Есть неудачные доставки (retry)");
+ if(f.upstream&&!f.upstream.ok)bad("alerts.in.ua: "+f.upstream.error);
+ if(f.webhook){if(!f.webhook.ok)wr("Webhook: "+f.webhook.error);else if(!f.webhook.info.url)bad("Webhook не установлен");else if(f.webhook.info.last_error_message)wr("Webhook: "+f.webhook.info.last_error_message)}
+ if(f.users&&f.users.ok&&f.users.stats.pending)wr(f.users.stats.pending+" пользователей ждут доставки");
+ if(f.kvWrite&&!f.kvWrite.ok)bad("Запись в KV не работает: "+f.kvWrite.error);
+ return{lvl:lvl,is:is}}
+function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.raions.length:0;
+ var T={ok:["✓","Всё работает","Критических проблем не обнаружено"],warn:["!","Есть замечания",""],bad:["✕","Есть проблемы",""]}[h.lvl];
+ var o='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
+ o+='<div class="metrics"><div class="m'+(n?' hl':'')+'"><div class="v">'+n+'</div><div class="l">Активных тревог</div></div>'
+  +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
+  +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.total:"—")+'</div><div class="l">Пользователей</div></div>'
+  +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.pending:"—")+'</div><div class="l">Ждут доставки</div></div></div>';
+ var u=f.upstream,w=f.webhook,L="";
+ L+=li("⚙",d.bindings.alertsKey&&d.bindings.botToken&&d.bindings.cache&&d.bindings.users?"ok":"bad","Переменные и биндинги","API key "+(d.bindings.alertsKey?"✓":"✕")+" · Bot "+(d.bindings.botToken?"✓":"✕")+" · KV cache "+(d.bindings.cache?"✓":"✕")+" · KV users "+(d.bindings.users?"✓":"✕"),"","sy");
+ L+=li("◷",!s?"bad":s.ageSeconds>2100?"bad":s.ageSeconds>d.config.cacheWriteIntervalSec?"warn":"ok","Снапшот KV",s?"Обновлено "+dtm(s.fetchedAt)+" · edge-кэш /api: "+(d.edgeCache?"есть":"пуст"):"cron ещё не отработал",s?age(s.ageSeconds):"","sy");
+ L+=li("☁",u?(u.ok?"ok":"bad"):"","alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):u.error):"Не проверено — нажмите «Полная проверка»",u?u.ms+" мс":"","sy");
+ L+=li("✈",w?(w.ok&&w.info.url&&!w.info.last_error_message?"ok":"warn"):"","Telegram webhook",w?(w.ok?(w.info.last_error_message||("pending: "+w.info.pending_update_count)):w.error):"Не проверено",w&&w.ok?w.ms+" мс":"","sy");
+ o+=card("Сервисы",L);
+ if(n){o+=card("Сейчас в тревоге",activeList(6)+(n>6?'<div class="row" style="margin-top:8px"><button class="btn t" onclick="tab(\\'al\\')">Показать все ('+n+')</button></div>':""))}
+ return o}
+var RK={red:0,yellow:1,green:2},LB={red:"Красный",yellow:"Жёлтый",green:"Зелёный"},GH={red:"🔴 Красные",yellow:"🟡 Жёлтые",green:"🟢 Спокойно"};
+var FL=[["all","Все"],["red","🔴 Красные"],["yellow","🟡 Жёлтые"],["green","🟢 Спокойно"],["o","Области"],["r","Районы"]];
+var SO=[["lvl","По уровню тревоги (красные → зелёные)"],["dur","По длительности тревоги"],["name","По названию (А–Я)"]];
+function all(){var d=S.d,s=d.snapshot,R=d.regions||{o:{},d:{}},ao={},ar={},res=[],k;
+ if(s){s.oblasts.forEach(function(o){ao[o.key]=o});s.raions.forEach(function(r){ar[r.key]=r})}
+ function lv(x){return x?(x.alert_level==="yellow"?"yellow":"red"):"green"}
+ for(k in R.o){var x=ao[k];res.push({t:"o",n:R.o[k],l:lv(x),at:x&&x.started_at})}
+ for(k in R.d){var y=ar[k],ob=k.split(":")[0];res.push({t:"r",n:(R.o[ob]||ob).replace(" область","")+" · "+R.d[k]+" район",l:lv(y),at:y&&y.started_at})}
+ return res}
+function items(){return all().filter(function(x){return x.l!=="green"})}
+function cmp(m){return function(a,b){var nm=a.n.localeCompare(b.n,"uk");
+ if(m==="name")return nm;
+ if(m==="dur")return((a.l==="green")-(b.l==="green"))||(new Date(a.at||0)-new Date(b.at||0))||nm;
+ return(RK[a.l]-RK[b.l])||(a.at&&b.at?new Date(a.at)-new Date(b.at):0)||nm}}
+function rowOf(x){var g=x.l==="green";
+ return li(x.t==="o"?"🗺":"◎",x.l==="red"?"bad":x.l==="yellow"?"warn":"ok",x.n,(x.t==="o"?"Область":"Район")+(g?" · тревоги нет":" · с "+tm(x.at)),'<span class="tag '+x.l+'">'+LB[x.l]+'</span>'+(g?"":"<br>"+dur(x.at)))}
+function activeList(max){return items().sort(cmp("lvl")).slice(0,max).map(rowOf).join("")}
+function vAl(){var a=all(),c={all:a.length,red:0,yellow:0,green:0,o:0,r:0};
+ a.forEach(function(x){c[x.l]++;c[x.t]++});
+ var ch=FL.map(function(f,i){return'<button class="chip'+(S.flt===f[0]?" on":"")+'" onclick="setF('+i+')">'+f[1]+' · '+c[f[0]]+'</button>'}).join("");
+ var mn=SO.map(function(s,i){return'<div class="mi'+(S.sort===s[0]?" on":"")+'" onclick="setS('+i+')"><span>'+(S.sort===s[0]?"✓":"")+'</span>'+s[1]+'</div>'}).join("");
+ var cur=SO.filter(function(s){return s[0]===S.sort})[0][1].split(" (")[0];
+ var o='<div class="row" style="flex-wrap:nowrap;align-items:center"><div class="field" style="flex:1"><span>🔍</span><input id="q" placeholder="Поиск региона или района" value="'+esc(S.q)+'" oninput="S.q=this.value;listOnly()"></div>'
+  +'<div style="position:relative"><button class="btn o" onclick="toggleMenu(event)">⇅ '+esc(cur)+'</button><div class="menu" id="menu">'+mn+'</div></div></div>'
+  +'<div class="chips">'+ch+'</div><div class="card" id="lst"></div>';
+ setTimeout(listOnly,0);return o}
+function listOnly(){var el=$("lst");if(!el||!S.d)return;var q=S.q.trim().toLowerCase(),F=S.flt;
+ var a=all().filter(function(x){return(F==="all"||F===x.l||F===x.t)&&(!q||x.n.toLowerCase().indexOf(q)>-1)}).sort(cmp(S.sort));
+ if(!a.length){el.innerHTML='<div class="empty"><div class="big">🔎</div>'+(S.d.regions?"Ничего не найдено":"Нет данных")+'</div>';return}
+ var h='<h2>Найдено: '+a.length+'</h2>',prev=null,cnt={};
+ if(S.sort==="lvl")a.forEach(function(x){cnt[x.l]=(cnt[x.l]||0)+1});
+ a.forEach(function(x){if(S.sort==="lvl"&&x.l!==prev){h+='<div class="sh">'+GH[x.l]+' · '+cnt[x.l]+'</div>';prev=x.l}h+=rowOf(x)});
+ el.innerHTML=h}
+function setF(i){S.flt=FL[i][0];draw()}
+function setS(i){S.sort=SO[i][0];draw()}
+function toggleMenu(e){e.stopPropagation();$("menu").classList.toggle("on")}
+document.addEventListener("click",function(){var m=$("menu");if(m)m.classList.remove("on")});
+function bars(obj,total){return Object.keys(obj).map(function(k){var v=obj[k],p=total?Math.round(v*100/total):0;return'<div class="bl"><span>'+esc(k)+'</span><span>'+v+' · '+p+'%</span></div><div class="bar"><i style="width:'+p+'%"></i></div>'}).join("")}
+function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="big">👥</div>Статистика пользователей загружается при полной проверке<br><br><button class="btn f" onclick="load(true)">Проверить</button></div>';
+ if(!u.ok)return card("Пользователи",kv("Ошибка",u.error,"bad"));var t=u.stats,tot=t.total-t.noRegion;
+ var o='<div class="metrics"><div class="m hl"><div class="v">'+t.total+'</div><div class="l">Всего</div></div><div class="m"><div class="v">'+(t.total-t.notifyOff)+'</div><div class="l">С уведомлениями</div></div><div class="m"><div class="v">'+t.notifyOff+'</div><div class="l">Отключили</div></div><div class="m"><div class="v '+(t.pending?"warn":"")+'">'+t.pending+'</div><div class="l">Ждут доставки</div></div></div>';
+ o+=card("Языки",bars(t.byLang,tot));
+ o+=card("Состояние (last_alert_state)",bars(t.byState,tot));
+ o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
+ o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
+function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,true)">Тест записи KV</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в KV/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
+ o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи KV",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
+ if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
+ var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":"Ошибка",u.ok?"ok":"bad")+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
+ var w=f.webhook;if(w){var i=w.info||{};o+=card("Telegram webhook",w.ok?kv("URL",i.url||"не задан",i.url?"":"bad")+kv("В очереди",i.pending_update_count,i.pending_update_count>0?"warn":"ok")+kv("Последняя ошибка",i.last_error_message||"нет",i.last_error_message?"bad":"ok")+kv("Когда",i.last_error_date?dtm(i.last_error_date*1000):"—")+kv("Макс. соединений",i.max_connections)+kv("Ответ",w.ms+" мс"):kv("Ошибка",w.error,"bad"))}
+ if(f.kvWrite)o+=card("Тест записи KV",kv("Результат",f.kvWrite.ok?"OK · "+f.kvWrite.ms+" мс":f.kvWrite.error,f.kvWrite.ok?"ok":"bad"));
+ var r=JSON.parse(JSON.stringify({d:d,full:f}));if(r.d.snapshot){delete r.d.snapshot.oblasts;delete r.d.snapshot.raions}
+ o+=card("Raw JSON",'<pre>'+esc(JSON.stringify(r,null,2))+'</pre>');return o}
+function draw(){if(!S.d){$("view").innerHTML='<div class="empty card">Загрузка…</div>';return}
+ var v={ov:vOv,al:vAl,us:vUs,sy:vSy}[S.tab]();var q=$("q"),foc=q&&document.activeElement===q,pos=foc?q.selectionStart:0;
+ $("view").innerHTML=v;if(foc){q=$("q");q.focus();q.setSelectionRange(pos,pos)}
+ $("sub").textContent="v"+S.d.version+" · обновлено "+new Date().toLocaleTimeString("ru-RU",{timeZone:TZ})}
+function snack(m){var e=$("snack");e.textContent=m;e.classList.add("on");clearTimeout(snack.t);snack.t=setTimeout(function(){e.classList.remove("on")},3500)}
+function busy(n){S.busy+=n;$("prog").classList.toggle("on",S.busy>0)}
+function load(full,kv){busy(1);
+ fetch("/admin/data"+(full?"?full=1"+(kv?"&kv=1":""):""),{cache:"no-store"}).then(function(r){if(r.status===401){location.href="/admin";return}return r.json()}).then(function(d){if(!d)return;
+  if(full)["upstream","webhook","users","kvWrite"].forEach(function(k){if(d[k])S.f[k]=d[k]});
+  S.d=d;draw();if(full)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
+function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
+ $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){snack(name+": "+(j.ok?"успешно":JSON.stringify(j).slice(0,120)));load(true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
+$("dn").onclick=function(){$("scrim").classList.remove("on")};
+$("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
+$("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};$("fab").onclick=function(){load(true)};
+$("auto").onclick=function(){S.auto=!S.auto;this.classList.toggle("on",S.auto)};
+nav();draw();load(true);setInterval(function(){if(S.auto&&!document.hidden)load(false)},30000);
+</script></body></html>`;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -919,9 +1304,20 @@ export default {
       return new Response(null, { status: 204, headers: cors });
     }
 
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+      return await handleAdmin(request, env, url);
+    }
+
     if (url.pathname === "/") {
       return json({ ok: true, service: "Air Raid Alert — Universal Worker" });
     }
+
+    // These two used to be public. Once ADMIN_TOKEN is configured they require it
+    // (cookie from /admin?token=... or "Authorization: Bearer ..."). Before that
+    // they keep working so the first webhook setup is still possible.
+    const adminGate = (url.pathname === "/setup-webhook" || url.pathname === "/webhook-info") &&
+      env.ADMIN_TOKEN && !(await isAdmin(request, env));
+    if (adminGate) return new Response("Unauthorized. Open /admin?token=... first", { status: 401 });
 
     if (url.pathname === "/setup-webhook") {
       return await handleSetupWebhook(request, env);
