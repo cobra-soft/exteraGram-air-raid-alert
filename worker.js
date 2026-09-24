@@ -4,6 +4,7 @@ const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
 const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
+const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
 const SNAPSHOT_KEY = "alerts-in-ua";
 const DEVICE_LINK_TTL_SECONDS = 600;
 const UPDATE_DEDUP_TTL_SECONDS = 120;
@@ -218,11 +219,11 @@ async function readCache(cache) {
   return null;
 }
 
-async function writeCache(cache, data, fetchedAt = Date.now(), signature = null, pendingRetry = false) {
+async function writeCache(cache, data, fetchedAt = Date.now(), signature = null, pendingRetry = 0) {
   try {
     await cache.put(
       SNAPSHOT_KEY,
-      JSON.stringify({ fetchedAt, signature: signature || buildStatusSignature(data), data, pendingRetry: !!pendingRetry })
+      JSON.stringify({ fetchedAt, signature: signature || buildStatusSignature(data), data, pendingRetry: Number(pendingRetry) || 0 })
     );
   } catch (e) {
     console.error("[cache] write error:", e);
@@ -242,7 +243,7 @@ const OBLAST_NAME_TO_SLUG = {
   "Івано-Франківська область": "ivano-frankivska",
   "Київська область": "kyivska",
   "м. Київ": "kyiv-city",
-  "Кіровоградська область": "kirovohradska",
+  "Кір��воградська область": "kirovohradska",
   "Луганська область": "luhanska",
   "Львівська область": "lvivska",
   "Миколаївська область": "mykolaivska",
@@ -342,15 +343,6 @@ async function fetchUpstream(env) {
         started_at: alert.started_at
       };
     } else if (alert.location_type === 'raion') {
-      // IMPORTANT: for location_type === 'raion', alerts.in.ua puts the
-      // raion's own name in location_title, not location_raion.
-      // location_raion is only populated on sub-raion entries (hromada,
-      // city) where it names the *parent* raion. The old code checked
-      // `alert.location_raion`, which is undefined on raion-type alerts,
-      // so every district-level air raid alert fell through to the
-      // "unmapped location_type" branch below and was silently dropped —
-      // raions[] was always empty and district-subscribed users never got
-      // notified, no matter how many real raion alerts were active.
       const raionName = alert.location_raion || alert.location_title;
       if (!raionName) {
         console.error(`[alerts.in.ua] raion alert with no name (id ${alert.id}) in ${alert.location_oblast}`);
@@ -370,9 +362,6 @@ async function fetchUpstream(env) {
         started_at: alert.started_at
       });
     } else {
-      // city / hromada / unknown location_type: we don't have a reliable slug
-      // mapping for these, so we deliberately skip them rather than
-      // misattributing the alert to the whole oblast or a wrong district.
       console.error(`[alerts.in.ua] skipping unmapped location_type "${alert.location_type}" in ${alert.location_oblast}`);
     }
   }
@@ -452,7 +441,6 @@ async function getPublicAlerts(env, request, ctx = null) {
   return { ...payload, serverTime: new Date().toISOString() };
 }
 
-
 function slug(v) {
   return String(v || "").trim().toLowerCase().replace(/ё/g, "е").replace(/і/g, "i").replace(/ї/g, "i").replace(/є/g, "ie").replace(/ґ/g, "g").replace(/[^a-zа-яіїє0-9]+/gi, "-").replace(/^-+|-+$/g, "");
 }
@@ -515,9 +503,9 @@ function findAlert(data, oblastKey, districtKey) {
 function alertStatus(data, oblastKey, districtKey) {
   const alert = findAlert(data, oblastKey, districtKey);
   if (!alert) return { state: "clear", since: null };
-  return { 
-    state: alert.alert_level === "yellow" ? "yellow" : "red", 
-    since: alert.started_at 
+  return {
+    state: alert.alert_level === "yellow" ? "yellow" : "red",
+    since: alert.started_at
   };
 }
 
@@ -556,22 +544,20 @@ async function checkAllUsers(env) {
   const changed = previous.signature !== signature;
   const lastWriteAt = previous.fetchedAt || 0;
   const dueForRefresh = now - lastWriteAt >= MIN_CACHE_WRITE_INTERVAL_SECONDS * 1000;
-  // If the previous tick left any Telegram deliveries unconfirmed, keep
-  // re-scanning every tick (not only when the global status changes again)
-  // until everyone is caught up — otherwise a failed send for an otherwise
-  // unchanged status would never get another chance to go out.
-  const needsRetryPass = previous.pendingRetry === true;
+  const retrySince = typeof previous.pendingRetry === "number" ? previous.pendingRetry : (previous.pendingRetry === true ? now : 0);
+  const needsRetryPass = retrySince > 0 && now - retrySince < RETRY_WINDOW_MS;
+  const retryBefore = needsRetryPass ? retrySince : 0;
 
-  // Publish the new snapshot BEFORE sending Telegram messages, so the plugin
-  // (which reads this snapshot) can see the change at the same moment the bot
-  // starts sending, instead of only after every message has been delivered.
   if (changed || dueForRefresh) {
-    await writeCache(env.CACHE, data, now, signature, needsRetryPass);
+    await writeCache(env.CACHE, data, now, signature, retryBefore);
   }
 
   if (changed || needsRetryPass) {
     const hadFailures = await notifyUsers(env, previous.data, data, now);
-    await writeCache(env.CACHE, data, now, signature, hadFailures);
+    const retryAfter = hadFailures ? (retryBefore || now) : 0;
+    if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
+      await writeCache(env.CACHE, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
+    }
   }
 }
 
@@ -585,14 +571,13 @@ async function deliverChange(env, job, now) {
   } else {
     text = stateMessage(user.region_name, newStatus);
   }
-  const delivered = await sendTelegramMessage(env.BOT_TOKEN, user.chat_id, text);
-  if (!delivered) {
-    // Do NOT advance last_alert_state on a failed send. notifyUsers() gates
-    // on this field, so leaving it untouched means this user stays "behind"
-    // and gets retried on the next tick instead of the notification being
-    // silently lost forever.
-    console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry next tick`);
+  const res = await sendTelegramDetailed(env.BOT_TOKEN, user.chat_id, text);
+  if (!res.ok && !res.permanent) {
+    console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry`);
     return false;
+  }
+  if (!res.ok && res.permanent) {
+    console.error(`[notify] permanent failure for chat ${user.chat_id} (HTTP ${res.status}), not retrying`);
   }
   user.last_alert_state = newStatus.state;
   user.last_alert_active = newStatus.state !== "clear";
@@ -611,16 +596,8 @@ async function notifyUsers(env, previousData, data, now) {
     for (const item of page.keys || []) {
       const user = item.metadata || await readUser(env, item.name);
       if (!user || !user.chat_id || !user.oblast_key) continue;
-      // Notification "blacklist": everyone is in the DB, but users who
-      // turned notifications off in the plugin get no bot messages.
       if (user.notify === false) continue;
       const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-      // Gate on what THIS user was last actually (successfully) notified
-      // of, not on the global snapshot diff. deliverChange() only advances
-      // last_alert_state after a confirmed send, so a user whose message
-      // failed simply stays "behind" here and keeps getting retried every
-      // tick until it goes through, instead of being silently skipped
-      // forever once the global snapshot moves on.
       const knownState = user.last_alert_state || "clear";
       if (knownState === newStatus.state) continue;
       const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
@@ -662,42 +639,42 @@ const MESSAGES = {
 };
 
 async function sendTelegramMessage(botToken, chatId, text) {
+  return (await sendTelegramDetailed(botToken, chatId, text)).ok;
+}
+
+// Returns { ok, permanent, status }. permanent = retrying can never help
+// (403 bot blocked, 400 chat not found, 404).
+async function sendTelegramDetailed(botToken, chatId, text) {
   if (!botToken) {
     console.error("[telegram] BOT_TOKEN not set");
-    return false;
+    return { ok: false, permanent: false, status: 0 };
   }
   const payload = JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" });
+  const doSend = () => fetchWithTimeout(`${TELEGRAM_API}${botToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload
+  }, FETCH_TIMEOUT_MS);
   try {
-    let r = await fetchWithTimeout(`${TELEGRAM_API}${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: payload
-    }, FETCH_TIMEOUT_MS);
+    let r = await doSend();
     if (r.status === 429) {
-      // Telegram is rate-limiting us (likely during a mass alert fanout).
-      // Back off for what it tells us to (capped, so one slow chat can't
-      // stall a whole batch) and retry once instead of just dropping the
-      // message.
       let retryAfter = 1;
       try {
         const body = await r.clone().json();
         retryAfter = (body && body.parameters && body.parameters.retry_after) || 1;
       } catch (_) {}
       await new Promise(res => setTimeout(res, Math.min(retryAfter, 3) * 1000));
-      r = await fetchWithTimeout(`${TELEGRAM_API}${botToken}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: payload
-      }, FETCH_TIMEOUT_MS);
+      r = await doSend();
     }
     if (!r.ok) {
       console.error(`[telegram] sendMessage HTTP ${r.status}:`, await r.text());
-      return false;
+      const permanent = r.status === 400 || r.status === 403 || r.status === 404;
+      return { ok: false, permanent, status: r.status };
     }
-    return true;
+    return { ok: true, permanent: false, status: r.status };
   } catch (e) {
     console.error("[telegram] sendMessage error:", e);
-    return false;
+    return { ok: false, permanent: false, status: 0 };
   }
 }
 
@@ -786,14 +763,6 @@ async function handleTelegramWebhook(request, env) {
       JSON.stringify({ chat_id: String(chatId), lang, sync_token: syncToken, connected_at: new Date().toISOString() }),
       { expirationTtl: DEVICE_LINK_TTL_SECONDS }
     );
-    // NOTE: we deliberately do NOT send MESSAGES.connected here anymore.
-    // This is only the device *link* being created (the user tapped the
-    // deep link) — the plugin still has to poll /telegram/get-chat-id and
-    // call /register successfully before the connection is real. Sending
-    // "подключено" at this point caused it to fire even when the plugin
-    // later failed to finish registration (bugs #1 and #2). The real
-    // confirmation is now sent from the /register handler, only once
-    // registration actually succeeds.
   } else if (command === "/start") {
     await sendTelegramMessage(env.BOT_TOKEN, chatId, MESSAGES.genericStart);
   }
@@ -875,11 +844,6 @@ export default {
         const key = `user:${chat_id}`;
         const existing = await readUser(env, key);
 
-        // A device link is proof the person just pressed Start for THIS
-        // Telegram chat via a fresh deep link — that's real ownership proof
-        // on its own, independent of whatever sync_token the client may or
-        // may not already have. We resolve it up front so it can be used to
-        // recover a desynced connection below, not only for brand-new users.
         let deviceLink = null;
         if (body.device_id) {
           const candidate = await env.USERS.get(`device:${body.device_id}`, "json");
@@ -888,14 +852,6 @@ export default {
           }
         }
 
-        // Only enforce the existing sync_token when there is no fresh,
-        // valid device link to fall back on. Without this, a client that
-        // ever loses track of its sync_token (a timed-out /register whose
-        // response never arrived, a reinstall, cleared app data, or the
-        // rollback in telegram_connect() after a failed registration) would
-        // be permanently locked out: every future attempt reuses a NEW
-        // device link/token that can never match the OLD one already
-        // stored server-side. A valid device link lets it re-link instead.
         if (existing && existing.sync_token && !validSyncToken(existing, sync_token) && !deviceLink) {
           return json({ error: "invalid sync token" }, 403);
         }
@@ -916,9 +872,6 @@ export default {
           String(existing.region_name || "") === String(region_name || "");
         const sameLanguage = !!existing && existing.lang === "uk";
 
-        // Notification flag. Users always stay in the DB; notify=false just
-        // excludes them from bot messages. Missing flag = on (old records,
-        // old plugin versions that don't send it).
         const prevNotify = existing ? existing.notify !== false : true;
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
