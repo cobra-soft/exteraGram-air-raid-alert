@@ -3,7 +3,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
-const WORKER_VERSION = "i18n-admin-ui-2026-09-24"; // shown in /health so you can verify which file is deployed
+const WORKER_VERSION = "ratelimit-fix-2026-09-28"; // shown in /health so you can verify which file is deployed
 const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
@@ -320,7 +320,13 @@ async function fetchUpstream(env) {
   const r = await fetchWithTimeout(ALERTS_API, {
       headers: { 'Authorization': `Bearer ${env.ALERTS_API_KEY}` }
     }, FETCH_TIMEOUT_MS);
-  if (!r.ok) throw new Error(`alerts.in.ua HTTP ${r.status}`);
+  if (!r.ok) {
+    const err = new Error(`alerts.in.ua HTTP ${r.status}`);
+    err.status = r.status;
+    const ra = Number(r.headers.get("Retry-After"));
+    err.retryAfterMs = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 0;
+    throw err;
+  }
   const json = await r.json();
   if (!json.alerts) return { alerts: [], oblasts: [], raions: [] };
   
@@ -398,13 +404,77 @@ function statusChanged(previous, current) {
   return prevSig !== currSig;
 }
 
+// alerts.in.ua limits requests per SECOND and blocks IPs/tokens that keep
+// breaking the limit (see devs.alerts.in.ua). Only the cron tick may hit the
+// API "fresh"; everything else (dashboard, /health, stale-snapshot self-heal)
+// goes through this per-isolate memo: results are reused for maxAgeMs, parallel
+// callers share one request, and after a 429 nobody calls until the cooldown ends.
+const upstreamMem = { data: null, at: 0, cooldownUntil: 0, lastError: null, inflight: null };
+
+async function fetchUpstreamShared(env, maxAgeMs = 30000) {
+  const now = Date.now();
+  if (upstreamMem.data && now - upstreamMem.at < maxAgeMs) return upstreamMem.data;
+  if (now < upstreamMem.cooldownUntil && upstreamMem.lastError) throw upstreamMem.lastError;
+  if (upstreamMem.inflight) return upstreamMem.inflight;
+  upstreamMem.inflight = (async () => {
+    try {
+      const d = await fetchUpstream(env);
+      upstreamMem.data = d; upstreamMem.at = Date.now(); upstreamMem.lastError = null; upstreamMem.cooldownUntil = 0;
+      return d;
+    } catch (e) {
+      if (e && e.status === 429) {
+        upstreamMem.lastError = e;
+        upstreamMem.cooldownUntil = Date.now() + (e.retryAfterMs || 60000);
+      }
+      throw e;
+    } finally {
+      upstreamMem.inflight = null;
+    }
+  })();
+  return upstreamMem.inflight;
+}
+
+// Cron only: one quick retry for transient failures (429 with a short Retry-After, 5xx, timeout).
+async function fetchUpstreamRetry(env) {
+  try {
+    return await fetchUpstream(env);
+  } catch (e) {
+    const transient = e && (e.status === 429 || e.status >= 500 || (!e.status && !/not configured/.test(String(e.message))));
+    if (!transient || (e.retryAfterMs || 0) > 5000) throw e;
+    await new Promise(r => setTimeout(r, e.status === 429 ? (e.retryAfterMs || 2500) : 1500));
+    return await fetchUpstream(env);
+  }
+}
+
+// Cron health record in KV. Written only when the state changes (or at most every
+// 10 min while it keeps failing), so it costs almost no KV writes.
+const CRON_STATUS_KEY = "cron-status";
+async function recordCron(env, ok, err) {
+  try {
+    const prev = await env.CACHE.get(CRON_STATUS_KEY, "json");
+    const now = Date.now();
+    if (ok) {
+      if (prev && prev.state === "fail") {
+        await env.CACHE.put(CRON_STATUS_KEY, JSON.stringify({ state: "ok", at: now, recoveredFrom: prev.since, error: prev.error }));
+      }
+      return;
+    }
+    const msg = String(err && err.message || err).slice(0, 160);
+    if (!prev || prev.state !== "fail") {
+      await env.CACHE.put(CRON_STATUS_KEY, JSON.stringify({ state: "fail", since: now, lastAt: now, error: msg }));
+    } else if (now - (prev.lastAt || 0) > 600000) {
+      await env.CACHE.put(CRON_STATUS_KEY, JSON.stringify({ ...prev, lastAt: now, error: msg }));
+    }
+  } catch (e) { /* diagnostics must never break the cron */ }
+}
+
 async function getSharedSnapshot(env) {
   const cached = await readCache(env.CACHE);
   if (cached) {
     return { ...cached, heartbeat: cached.fetchedAt };
   }
 
-  const data = await fetchUpstream(env);
+  const data = await fetchUpstreamShared(env);
   const fetchedAt = Date.now();
   const signature = buildStatusSignature(data);
   await writeCache(env.CACHE, data, fetchedAt, signature);
@@ -430,7 +500,7 @@ async function getPublicAlerts(env, request, ctx = null) {
   if (stored && stored.fetchedAt && Date.now() - stored.fetchedAt > 2100000 && !(await hasEphemeralFlag("live-refresh"))) {
     await setEphemeralFlag("live-refresh", 20);
     try {
-      const liveData = await fetchUpstream(env);
+      const liveData = await fetchUpstreamShared(env);
       const liveAt = Date.now();
       const liveSig = buildStatusSignature(liveData);
       await writeCache(env.CACHE, liveData, liveAt, liveSig); // swallows KV errors
@@ -457,7 +527,7 @@ async function getPublicAlerts(env, request, ctx = null) {
     return { ...payload, serverTime: new Date().toISOString() };
   }
 
-  const data = await fetchUpstream(env);
+  const data = await fetchUpstreamShared(env);
   const fetchedAt = Date.now();
   const signature = buildStatusSignature(data);
   await writeCache(env.CACHE, data, fetchedAt, signature);
@@ -559,11 +629,13 @@ async function checkAllUsers(env) {
   const previous = await readCache(env.CACHE);
   let data;
   try {
-    data = await fetchUpstream(env);
+    data = await fetchUpstreamRetry(env);
   } catch (e) {
     console.error("[upstream] scheduled fetch error:", e);
+    await recordCron(env, false, e);
     return;
   }
+  await recordCron(env, true);
   const now = Date.now();
   const signature = buildStatusSignature(data);
 
@@ -958,13 +1030,19 @@ async function isAdmin(request, env) {
   if (!Number.isFinite(exp) || exp < Date.now()) return false;
   return safeEqual(m[1].slice(dot + 1), await hmacHex(env.ADMIN_TOKEN, "adm:" + exp));
 }
+const failMem = new Map(); // ip -> { n, until }
 async function failCount(ip) {
+  const m = failMem.get(ip);
+  if (m && m.until > Date.now()) return m.n;
+  if (m) failMem.delete(ip);
   try {
     const r = await caches.default.match(new Request(`https://admin-fail.internal/${encodeURIComponent(ip)}`));
     return r ? Number(await r.text()) || 0 : 0;
   } catch (e) { return 0; }
 }
 async function bumpFail(ip, n) {
+  failMem.set(ip, { n, until: Date.now() + ADMIN_FAIL_WINDOW_SEC * 1000 });
+  if (failMem.size > 500) for (const [k, v] of failMem) if (v.until < Date.now()) failMem.delete(k);
   try {
     await caches.default.put(new Request(`https://admin-fail.internal/${encodeURIComponent(ip)}`),
       new Response(String(n), { headers: { "Cache-Control": `max-age=${ADMIN_FAIL_WINDOW_SEC}` } }));
@@ -1056,6 +1134,7 @@ async function adminData(env, request, full, kvTest) {
     config: { edgeTtl: EDGE_CACHE_TTL_SECONDS, cacheWriteIntervalSec: MIN_CACHE_WRITE_INTERVAL_SECONDS, retryWindowSec: RETRY_WINDOW_MS / 1000 }
   };
   const c = await readCache(env.CACHE);
+  try { out.cron = await env.CACHE.get(CRON_STATUS_KEY, "json"); } catch (e) { out.cron = null; }
   out.snapshot = c ? {
     fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
     pendingRetry: c.pendingRetry || 0, signature: c.signature,
@@ -1067,9 +1146,9 @@ async function adminData(env, request, full, kvTest) {
   } catch (e) { out.edgeCache = null; }
   if (!full) return out;
 
-  const timed = async (fn) => { const t = Date.now(); try { return { ok: true, ms: 0, ...(await fn()), _t: t }; } catch (e) { return { ok: false, error: String(e && e.message || e).slice(0, 300), _t: t }; } };
+  const timed = async (fn) => { const t = Date.now(); try { return { ok: true, ms: 0, ...(await fn()), _t: t }; } catch (e) { return { ok: false, error: String(e && e.message || e).slice(0, 300), rateLimited: !!(e && e.status === 429), _t: t }; } };
   const [up, wh, users, kv] = await Promise.all([
-    timed(async () => { const d = await fetchUpstream(env); return { rawAlerts: (d.alerts || []).length, oblasts: d.oblasts.length, raions: d.raions.length, sameAsSnapshot: c ? c.signature === buildStatusSignature(d) : null }; }),
+    timed(async () => { const d = await fetchUpstreamShared(env, 45000); return { rawAlerts: (d.alerts || []).length, oblasts: d.oblasts.length, raions: d.raions.length, sameAsSnapshot: c ? c.signature === buildStatusSignature(d) : null }; }),
     timed(async () => {
       if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN not configured");
       const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/getWebhookInfo`, {}, FETCH_TIMEOUT_MS);
@@ -1228,7 +1307,8 @@ function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  if(!d.bindings.alertsKey)bad("Нет ALERTS_API_KEY");if(!d.bindings.botToken)bad("Нет BOT_TOKEN");
  if(!d.snapshot)bad("Нет снапшота");else if(d.snapshot.ageSeconds>2100)bad("Снапшот устарел ("+age(d.snapshot.ageSeconds)+")");
  if(d.snapshot&&d.snapshot.pendingRetry)wr("Есть неудачные доставки (retry)");
- if(f.upstream&&!f.upstream.ok)bad("alerts.in.ua: "+f.upstream.error);
+ if(f.upstream&&!f.upstream.ok){if(f.upstream.rateLimited)wr("alerts.in.ua: лимит запросов (429). Бот и плагин работают по снимку");else bad("alerts.in.ua: "+f.upstream.error)}
+  if(d.cron&&d.cron.state==="fail"&&Date.now()-d.cron.lastAt<900000)wr("Cron: сбой опроса alerts.in.ua с "+dtm(d.cron.since)+" ("+d.cron.error+")");
  if(f.webhook){if(!f.webhook.ok)wr("Webhook: "+f.webhook.error);else if(!f.webhook.info.url)bad("Webhook не установлен");else if(whErr(f.webhook))wr("Webhook: "+whErr(f.webhook))}
  if(f.users&&f.users.ok&&f.users.stats.pending)wr(f.users.stats.pending+" пользователей ждут доставки");
  if(f.kvWrite&&!f.kvWrite.ok)bad("Запись в KV не работает: "+f.kvWrite.error);
@@ -1243,7 +1323,8 @@ function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.ra
  var u=f.upstream,w=f.webhook,L="";
  L+=li("⚙",d.bindings.alertsKey&&d.bindings.botToken&&d.bindings.cache&&d.bindings.users?"ok":"bad","Переменные и биндинги","API key "+(d.bindings.alertsKey?"✓":"✕")+" · Bot "+(d.bindings.botToken?"✓":"✕")+" · KV cache "+(d.bindings.cache?"✓":"✕")+" · KV users "+(d.bindings.users?"✓":"✕"),"","sy");
  L+=li("◷",!s?"bad":s.ageSeconds>2100?"bad":s.ageSeconds>d.config.cacheWriteIntervalSec?"warn":"ok","Снапшот KV",s?"Обновлено "+dtm(s.fetchedAt)+" · edge-кэш /api: "+(d.edgeCache?"есть":"пуст"):"cron ещё не отработал",s?age(s.ageSeconds):"","sy");
- L+=li("☁",u?(u.ok?"ok":"bad"):"","alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):u.error):"Не проверено — нажмите «Полная проверка»",u?u.ms+" мс":"","sy");
+ L+=li("☁",u?(u.ok?"ok":(u.rateLimited?"warn":"bad")):"","alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):(u.rateLimited?"Лимит запросов (429): проверка отложена, бот работает по снимку":u.error)):"Не проверено — нажмите «Полная проверка»",u?u.ms+" мс":"","sy");
+  var c=d.cron;L+=li("⏱",!c?"":(c.state==="fail"?"warn":"ok"),"Опрос alerts.in.ua (cron)",!c?"Сбоев не зафиксировано":(c.state==="fail"?"Сбой с "+dtm(c.since)+": "+c.error:"Восстановлен "+dtm(c.at)+" (сбой был с "+dtm(c.recoveredFrom)+")"),"","sy");
  L+=li("✈",w?(w.ok&&w.info.url&&!whErr(w)?"ok":"warn"):"","Telegram webhook",w?(w.ok?(whErr(w)||("pending: "+w.info.pending_update_count+(w.info.last_error_message?" · старая ошибка "+dtm(w.info.last_error_date*1000):""))):w.error):"Не проверено",w&&w.ok?w.ms+" мс":"","sy");
  o+=card("Сервисы",L);
  if(n){o+=card("Сейчас в тревоге",activeList(6)+(n>6?'<div class="row" style="margin-top:8px"><button class="btn t" onclick="tab(\\'al\\')">Показать все ('+n+')</button></div>':""))}
@@ -1297,7 +1378,7 @@ function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
  o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,true)">Тест записи KV</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в KV/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи KV",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
- var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":"Ошибка",u.ok?"ok":"bad")+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
+ var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
  var w=f.webhook;if(w){var i=w.info||{};o+=card("Telegram webhook",w.ok?kv("URL",i.url||"не задан",i.url?"":"bad")+kv("В очереди",i.pending_update_count,i.pending_update_count>0?"warn":"ok")+kv("Последняя ошибка",i.last_error_message||"нет",i.last_error_message?"bad":"ok")+kv("Когда",i.last_error_date?dtm(i.last_error_date*1000):"—")+kv("Макс. соединений",i.max_connections)+kv("Ответ",w.ms+" мс"):kv("Ошибка",w.error,"bad"))}
  if(f.kvWrite)o+=card("Тест записи KV",kv("Результат",f.kvWrite.ok?"OK · "+f.kvWrite.ms+" мс":f.kvWrite.error,f.kvWrite.ok?"ok":"bad"));
  var r=JSON.parse(JSON.stringify({d:d,full:f}));if(r.d.snapshot){delete r.d.snapshot.oblasts;delete r.d.snapshot.raions}
@@ -1360,19 +1441,25 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      // Diagnostics only: no secrets are returned, just booleans/errors.
+      // Public part is passive (no upstream call, no KV write): anyone could otherwise
+      // burn the alerts.in.ua rate limit and the daily KV write quota by reloading it.
       const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN };
-      try {
-        const d = await fetchUpstream(env);
-        out.upstream = { ok: true, oblasts: (d.oblasts || []).length, raions: (d.raions || []).length };
-      } catch (e) { out.upstream = { ok: false, error: String(e && e.message || e).slice(0, 200) }; }
       try {
         const c = await readCache(env.CACHE);
         out.snapshot = c ? { ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000), pendingRetry: c.pendingRetry || 0 } : null;
       } catch (e) { out.snapshot = { error: String(e).slice(0, 200) }; }
-      if (url.searchParams.get("kv") === "1") {
-        try { await env.CACHE.put("health-check", String(Date.now()), { expirationTtl: 120 }); out.kvWrite = { ok: true }; }
-        catch (e) { out.kvWrite = { ok: false, error: String(e && e.message || e).slice(0, 200) }; }
+      if (await isAdmin(request, env)) {
+        try {
+          const d = await fetchUpstreamShared(env, 45000);
+          out.upstream = { ok: true, oblasts: (d.oblasts || []).length, raions: (d.raions || []).length };
+        } catch (e) { out.upstream = { ok: false, rateLimited: !!(e && e.status === 429), error: String(e && e.message || e).slice(0, 200) }; }
+        try { out.cron = await env.CACHE.get(CRON_STATUS_KEY, "json"); } catch (e) { out.cron = null; }
+        if (url.searchParams.get("kv") === "1") {
+          try { await env.CACHE.put("health-check", String(Date.now()), { expirationTtl: 120 }); out.kvWrite = { ok: true }; }
+          catch (e) { out.kvWrite = { ok: false, error: String(e && e.message || e).slice(0, 200) }; }
+        }
+      } else {
+        out.detail = "log in at /admin for upstream and KV checks";
       }
       return json(out);
     }
