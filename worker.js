@@ -3,7 +3,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
-const WORKER_VERSION = "ratelimit-fix-2026-09-28"; // shown in /health so you can verify which file is deployed
+const WORKER_VERSION = "panel-noprobe-2026-09-28"; // shown in /health so you can verify which file is deployed
 const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
@@ -1126,7 +1126,7 @@ async function collectUsers(env, data) {
   return st;
 }
 
-async function adminData(env, request, full, kvTest) {
+async function adminData(env, request, full, kvTest, probeUp) {
   const out = {
     version: WORKER_VERSION, time: new Date().toISOString(), langs: Object.keys(TEXTS),
     bindings: { alertsKey: !!env.ALERTS_API_KEY, botToken: !!env.BOT_TOKEN, cache: !!env.CACHE, users: !!env.USERS },
@@ -1148,7 +1148,7 @@ async function adminData(env, request, full, kvTest) {
 
   const timed = async (fn) => { const t = Date.now(); try { return { ok: true, ms: 0, ...(await fn()), _t: t }; } catch (e) { return { ok: false, error: String(e && e.message || e).slice(0, 300), rateLimited: !!(e && e.status === 429), _t: t }; } };
   const [up, wh, users, kv] = await Promise.all([
-    timed(async () => { const d = await fetchUpstreamShared(env, 45000); return { rawAlerts: (d.alerts || []).length, oblasts: d.oblasts.length, raions: d.raions.length, sameAsSnapshot: c ? c.signature === buildStatusSignature(d) : null }; }),
+    probeUp ? timed(async () => { const d = await fetchUpstreamShared(env, 45000); return { rawAlerts: (d.alerts || []).length, oblasts: d.oblasts.length, raions: d.raions.length, sameAsSnapshot: c ? c.signature === buildStatusSignature(d) : null }; }) : Promise.resolve(null),
     timed(async () => {
       if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN not configured");
       const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/getWebhookInfo`, {}, FETCH_TIMEOUT_MS);
@@ -1185,7 +1185,7 @@ async function handleAdmin(request, env, url) {
     "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"
   } });
   if (p === "/admin/data") {
-    try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1")); }
+    try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1", url.searchParams.get("up") === "1")); }
     catch (e) { return adminJson({ error: String(e) }, 500); }
   }
   if (p === "/admin/action" && request.method === "POST") {
@@ -1307,7 +1307,7 @@ function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  if(!d.bindings.alertsKey)bad("Нет ALERTS_API_KEY");if(!d.bindings.botToken)bad("Нет BOT_TOKEN");
  if(!d.snapshot)bad("Нет снапшота");else if(d.snapshot.ageSeconds>2100)bad("Снапшот устарел ("+age(d.snapshot.ageSeconds)+")");
  if(d.snapshot&&d.snapshot.pendingRetry)wr("Есть неудачные доставки (retry)");
- if(f.upstream&&!f.upstream.ok){if(f.upstream.rateLimited)wr("alerts.in.ua: лимит запросов (429). Бот и плагин работают по снимку");else bad("alerts.in.ua: "+f.upstream.error)}
+ if(f.upstream&&!f.upstream.ok&&!f.upstream.rateLimited)bad("alerts.in.ua: "+f.upstream.error);
   if(d.cron&&d.cron.state==="fail"&&Date.now()-d.cron.lastAt<900000)wr("Cron: сбой опроса alerts.in.ua с "+dtm(d.cron.since)+" ("+d.cron.error+")");
  if(f.webhook){if(!f.webhook.ok)wr("Webhook: "+f.webhook.error);else if(!f.webhook.info.url)bad("Webhook не установлен");else if(whErr(f.webhook))wr("Webhook: "+whErr(f.webhook))}
  if(f.users&&f.users.ok&&f.users.stats.pending)wr(f.users.stats.pending+" пользователей ждут доставки");
@@ -1320,10 +1320,10 @@ function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.ra
   +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.total:"—")+'</div><div class="l">Пользователей</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.pending:"—")+'</div><div class="l">Ждут доставки</div></div></div>';
- var u=f.upstream,w=f.webhook,L="";
+ var u=f.upstream,w=f.webhook,c=d.cron,L="";
  L+=li("⚙",d.bindings.alertsKey&&d.bindings.botToken&&d.bindings.cache&&d.bindings.users?"ok":"bad","Переменные и биндинги","API key "+(d.bindings.alertsKey?"✓":"✕")+" · Bot "+(d.bindings.botToken?"✓":"✕")+" · KV cache "+(d.bindings.cache?"✓":"✕")+" · KV users "+(d.bindings.users?"✓":"✕"),"","sy");
  L+=li("◷",!s?"bad":s.ageSeconds>2100?"bad":s.ageSeconds>d.config.cacheWriteIntervalSec?"warn":"ok","Снапшот KV",s?"Обновлено "+dtm(s.fetchedAt)+" · edge-кэш /api: "+(d.edgeCache?"есть":"пуст"):"cron ещё не отработал",s?age(s.ageSeconds):"","sy");
- L+=li("☁",u?(u.ok?"ok":(u.rateLimited?"warn":"bad")):"","alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):(u.rateLimited?"Лимит запросов (429): проверка отложена, бот работает по снимку":u.error)):"Не проверено — нажмите «Полная проверка»",u?u.ms+" мс":"","sy");
+ L+=li("☁",u?(u.ok?"ok":(u.rateLimited?"warn":"bad")):(!s?"bad":(c&&c.state==="fail"?"warn":"ok")),"alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):(u.rateLimited?"Живая проверка: лимит запросов (429). На бота это не влияет — он берёт данные через cron":u.error)):(c&&c.state==="fail"?"Cron получает ошибки — см. строку ниже":"Данные приходят через cron без сбоев. Живая проверка — вкладка «Система»"),u?u.ms+" мс":"","sy");
   var c=d.cron;L+=li("⏱",!c?"":(c.state==="fail"?"warn":"ok"),"Опрос alerts.in.ua (cron)",!c?"Сбоев не зафиксировано":(c.state==="fail"?"Сбой с "+dtm(c.since)+": "+c.error:"Восстановлен "+dtm(c.at)+" (сбой был с "+dtm(c.recoveredFrom)+")"),"","sy");
  L+=li("✈",w?(w.ok&&w.info.url&&!whErr(w)?"ok":"warn"):"","Telegram webhook",w?(w.ok?(whErr(w)||("pending: "+w.info.pending_update_count+(w.info.last_error_message?" · старая ошибка "+dtm(w.info.last_error_date*1000):""))):w.error):"Не проверено",w&&w.ok?w.ms+" мс":"","sy");
  o+=card("Сервисы",L);
@@ -1375,7 +1375,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,true)">Тест записи KV</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в KV/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи KV</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в KV/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи KV",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
@@ -1389,8 +1389,8 @@ function draw(){if(!S.d){$("view").innerHTML='<div class="empty card">Загру
  $("sub").textContent=new Date().toLocaleTimeString("ru-RU",{timeZone:TZ})+" · "+S.d.version}
 function snack(m){var e=$("snack");e.textContent=m;e.classList.add("on");clearTimeout(snack.t);snack.t=setTimeout(function(){e.classList.remove("on")},2500)}
 function busy(n){S.busy+=n;$("prog").classList.toggle("on",S.busy>0)}
-function load(full,kv,quiet){busy(1);
- fetch("/admin/data"+(full?"?full=1"+(kv?"&kv=1":""):""),{cache:"no-store"}).then(function(r){if(r.status===401){location.href="/admin";return}return r.json()}).then(function(d){if(!d)return;
+function load(full,kv,quiet,up){busy(1);
+ fetch("/admin/data"+(full?"?full=1"+(kv?"&kv=1":"")+(up?"&up=1":""):""),{cache:"no-store"}).then(function(r){if(r.status===401){location.href="/admin";return}return r.json()}).then(function(d){if(!d)return;
   if(full)["upstream","webhook","users","kvWrite"].forEach(function(k){if(d[k])S.f[k]=d[k]});
   S.d=d;draw();if(full&&!quiet)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
 function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
