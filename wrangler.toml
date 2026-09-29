@@ -5,8 +5,15 @@ compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
 kv_namespaces = [
-  { binding = "CACHE", id = "dd93d4c6a7c24110812e94dd8930206e" },
   { binding = "USERS", id = "23d60800f794435b8596c28c62de177c" }
+  # CACHE namespace removed from code (moved to D1 below). Left commented
+  # here in case you need to roll back quickly — nothing reads/writes it
+  # anymore, so it's safe to delete once the migration is confirmed stable.
+  # , { binding = "CACHE", id = "dd93d4c6a7c24110812e94dd8930206e" }
+]
+
+d1_databases = [
+  { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
 [triggers]
