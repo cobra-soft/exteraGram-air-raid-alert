@@ -850,10 +850,11 @@ const TEXTS = {
   }
 };
 
-// Bot language follows the plugin language ("uk" default). Anything unknown -> uk.
+// Bot language follows the plugin language. Anything unknown -> en (changed from
+// "uk" per request, to match telegram_client.py's telegram_lang() fallback).
 function normLang(v) {
   const l = String(v || "").toLowerCase().slice(0, 2);
-  return l === "ru" || l === "en" || l === "uk" ? l : "uk";
+  return l === "ru" || l === "en" || l === "uk" ? l : "en";
 }
 function M(lang) { return TEXTS[normLang(lang)]; }
 
@@ -1483,7 +1484,8 @@ async function processBroadcastBatch(env, limit = 20) {
         try {
           const recipientUser = await readUser(env, `user:${rec.chat_id}`);
           const rawRecipientLanguage = String(recipientUser && recipientUser.lang || "").toLowerCase().slice(0, 2);
-          const recipientLanguage = ["ru", "uk", "en"].includes(rawRecipientLanguage) ? rawRecipientLanguage : "ru";
+          // Unknown language -> en (changed from "ru" for consistency with normLang()/telegram_lang()).
+          const recipientLanguage = ["ru", "uk", "en"].includes(rawRecipientLanguage) ? rawRecipientLanguage : "en";
           const recipientText = String(translations[recipientLanguage] || translations.ru || job.text);
           const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:rec.chat_id,text:recipientText}) }, FETCH_TIMEOUT_MS);
           const j = await r.json().catch(()=>({}));
