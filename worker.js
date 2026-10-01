@@ -3,7 +3,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
-const WORKER_VERSION = "air-raid-panel-2026-09-30"; // shown in /health so you can verify which file is deployed
+const WORKER_VERSION = "air-raid-panel-2026-10-01"; // shown in /health so you can verify which file is deployed
 const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
@@ -612,7 +612,15 @@ function findAlert(data, oblastKey, districtKey) {
   for (const x of (data.raions || [])) {
     if (!x || typeof x !== "object") continue;
     const key = String(x.key || "");
-    if (key === wanted || key.split(":")[1] === district) return x;
+    // BUG: this used to also match on `key.split(":")[1] === district` alone,
+    // ignoring the oblast entirely. With today's static district list no two
+    // oblasts share a district slug, so it happened to be harmless — but it's
+    // wrong by construction: the day two districts anywhere in the list ever
+    // collide on slug (new raion added upstream, a renamed region, etc.) this
+    // would silently attribute one oblast's alert/district to a user
+    // subscribed to a different oblast with the same district slug. Only the
+    // full "oblast:district" key should count as a match here.
+    if (key === wanted) return x;
   }
 
   for (const x of (data.oblasts || [])) {
@@ -707,7 +715,18 @@ async function deliverChange(env, job, now) {
   }
   // Best-effort dedupe: if KV writes are failing (quota), last_alert_state can't
   // be saved and the same message would be re-sent every tick.
-  const dedupeName = `notified:${user.chat_id}:${newStatus.state}:${newStatus.since || ""}`;
+  // BUG FIX: for the "clear" state, newStatus.since is always empty (an
+  // all-clear has no "since"), so the dedupe key used to be identical
+  // ("notified:<chat>:clear:") for every all-clear message from that chat.
+  // If two real alert cycles (red/yellow -> clear) ended within the 900s
+  // flag TTL, the second "all clear" notification was silently swallowed
+  // even though it was a genuinely new event. Use the alert's own start
+  // time (oldStatus.since, falling back to last_alert_start) so each
+  // occurrence gets its own dedupe key.
+  const dedupeOccurrence = newStatus.state === "clear"
+    ? (oldStatus.since || user.last_alert_start || "")
+    : (newStatus.since || "");
+  const dedupeName = `notified:${user.chat_id}:${newStatus.state}:${dedupeOccurrence}`;
   const alreadySent = await hasEphemeralFlag(dedupeName);
   const res = alreadySent ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
   if (res.ok && !alreadySent) await setEphemeralFlag(dedupeName, 900);
@@ -795,6 +814,8 @@ const TEXTS = {
     enabled: "✅ Сповіщення через Telegram увімкнено",
     unsubscribed: "❌ Сповіщення через Telegram вимкнено",
     test: "⚪ Це тестове повідомлення від Air Raid Alert.",
+    statusNoRegion: "⚪ Регіон ще не обрано.\nВідкрий налаштування плагіна Air Raid Alert і обери область.",
+    statusHeader: region => `📍 <b>${region}</b>`,
     units: { h: "год", m: "хв" }
   },
   ru: {
@@ -808,6 +829,8 @@ const TEXTS = {
     enabled: "✅ Уведомления через Telegram включены",
     unsubscribed: "❌ Уведомления через Telegram отключены",
     test: "⚪ Это тестовое сообщение от Air Raid Alert.",
+    statusNoRegion: "⚪ Регион ещё не выбран.\nОткрой настройки плагина Air Raid Alert и выбери область.",
+    statusHeader: region => `📍 <b>${region}</b>`,
     units: { h: "ч", m: "мин" }
   },
   en: {
@@ -821,6 +844,8 @@ const TEXTS = {
     enabled: "✅ Telegram notifications enabled",
     unsubscribed: "❌ Telegram notifications disabled",
     test: "⚪ This is a test message from Air Raid Alert.",
+    statusNoRegion: "⚪ No region selected yet.\nOpen the Air Raid Alert plugin settings and choose an oblast.",
+    statusHeader: region => `📍 <b>${region}</b>`,
     units: { h: "h", m: "min" }
   }
 };
@@ -1006,6 +1031,26 @@ async function handleTelegramWebhookInner(request, env) {
     // registration actually succeeds.
   } else if (command === "/start") {
     await sendTelegramTracked(env, chatId, M(message.from && message.from.language_code).genericStart);
+  } else if (command === "/status") {
+    // NEW: on-demand status check without opening the plugin. Uses the same
+    // getSharedSnapshot()/alertStatus() the plugin and the notifier use, so
+    // it's always consistent with what the bot would otherwise push.
+    const user = await readUser(env, `user:${chatId}`);
+    const lang = user ? normLang(user.lang) : normLang(message.from && message.from.language_code);
+    const m = M(lang);
+    if (!user || !user.oblast_key) {
+      await sendTelegramTracked(env, chatId, m.statusNoRegion);
+    } else {
+      try {
+        const snapshot = await getSharedSnapshot(env);
+        const status = alertStatus(snapshot.data, user.oblast_key, user.district_key);
+        const header = m.statusHeader(user.region_name || user.oblast_key);
+        const body = stateMessage(user.region_name || user.oblast_key, status, lang);
+        await sendTelegramTracked(env, chatId, `${header}\n${body}`);
+      } catch (e) {
+        console.error("[status] on-demand status failed:", e);
+      }
+    }
   }
 
   return json({ ok: true });
@@ -2144,8 +2189,13 @@ export default {
         }
 
         if (!env.BOT_TOKEN) return json({ error: "BOT_TOKEN not configured on worker" }, 500);
-        const ok = await sendTelegramTracked(env, chat_id, M(existing.lang).test);
-        if (!ok) return json({ error: "telegram sendMessage failed, check worker logs" }, 502);
+        const sendResult = await sendTelegramTracked(env, chat_id, M(existing.lang).test);
+        // BUG FIX: sendTelegramTracked() returns a result OBJECT ({ok, permanent,
+        // status, ...}), not a boolean. `if (!sendResult)` was always false (an
+        // object is truthy even as {ok:false}), so this endpoint reported success
+        // to the plugin's "Отправить тест" button even when Telegram delivery
+        // genuinely failed (bot blocked, bad token, Telegram API error, etc).
+        if (!sendResult.ok) return json({ error: sendResult.description || "telegram sendMessage failed, check worker logs" }, 502);
         return json({ ok: true });
       } catch (e) {
         return json({ error: String(e) }, 400);
