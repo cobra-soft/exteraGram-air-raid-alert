@@ -1368,6 +1368,30 @@ async function getBroadcastAudience(env, filter) {
   } while (cursor);
   return users;
 }
+function guessBroadcastSourceLanguage(text, requested) {
+  const lang = String(requested || "").toLowerCase();
+  if (["ru", "uk", "en"].includes(lang)) return lang;
+  const s = String(text || "");
+  if (/[іїєґІЇЄҐ]/.test(s)) return "uk";
+  if (/[а-яёА-ЯЁ]/.test(s)) return "ru";
+  return "en";
+}
+
+async function translateBroadcastVariants(env, text, requestedSource) {
+  const source = guessBroadcastSourceLanguage(text, requestedSource);
+  if (!env.AI || typeof env.AI.run !== "function") throw new Error("Workers AI не подключён. Добавь AI binding в wrangler.toml и включи Workers AI в Cloudflare, затем повтори предпросмотр.");
+  const translations = { ru: "", uk: "", en: "" };
+  translations[source] = text;
+  for (const target of ["ru", "uk", "en"].filter(x => x !== source)) {
+    const aiLanguage = { ru: "russian", uk: "ukrainian", en: "english" };
+    const result = await env.AI.run("@cf/meta/m2m100-1.2b", { text, source_lang: aiLanguage[source], target_lang: aiLanguage[target] });
+    const translated = String(result && (result.translated_text || result.translation || result.response) || "").trim();
+    if (!translated) throw new Error(`Перевод на ${target} не получен. Исходный текст не отправлен.`);
+    translations[target] = translated;
+  }
+  return { source_language: source, translations };
+}
+
 async function createBroadcast(env, body) {
   const text = String(body.text || "").trim();
   if (!text || text.length > 4096) return { error: "message must be 1-4096 characters", status: 400 };
@@ -1376,10 +1400,21 @@ async function createBroadcast(env, body) {
   if (!allowed.includes(filter.type || "all")) return { error: "invalid audience type", status: 400 };
   const normalized = { ...filter, type: filter.type || "all" };
   const recipients = await getBroadcastAudience(env, normalized);
-  if (body.preview === true || body.confirm !== true) return { ok: true, preview: true, count: recipients.length, audience: normalized };
+  let sourceLanguage = guessBroadcastSourceLanguage(text, body.source_language);
+  let translations = body.translations && typeof body.translations === "object" ? { ...body.translations } : null;
+  if (!translations && body.translate === false) translations = { ru: text, uk: text, en: text };
+  if (!translations) {
+    try { const result = await translateBroadcastVariants(env, text, body.source_language); sourceLanguage = result.source_language; translations = result.translations; }
+    catch (e) { return { error: String(e && e.message || e), status: 503 }; }
+  }
+  for (const lang of ["ru", "uk", "en"]) {
+    translations[lang] = String(translations[lang] || "").trim();
+    if (!translations[lang] || translations[lang].length > 4096) return { error: `missing or too long ${lang} translation`, status: 400 };
+  }
+  if (body.preview === true || body.confirm !== true) return { ok: true, preview: true, count: recipients.length, audience: normalized, source_language: sourceLanguage, translations };
   const now = new Date().toISOString();
-  const ins = await env.DB.prepare("INSERT INTO broadcast_jobs (text,audience_json,status,total_count,created_at,created_by) VALUES (?1,?2,'queued',?3,?4,?5)")
-    .bind(text, JSON.stringify(normalized), recipients.length, now, "admin").run();
+  const ins = await env.DB.prepare("INSERT INTO broadcast_jobs (text,translations_json,audience_json,status,total_count,created_at,created_by) VALUES (?1,?2,?3,'queued',?4,?5,?6)")
+    .bind(text, JSON.stringify(translations), JSON.stringify(normalized), recipients.length, now, "admin").run();
   const jobId = Number(ins.meta && ins.meta.last_row_id);
   for (let i=0;i<recipients.length;i+=50) {
     const batch = recipients.slice(i,i+50);
@@ -1390,16 +1425,22 @@ async function createBroadcast(env, body) {
 }
 async function processBroadcastBatch(env, limit = 20) {
   if (!env.DB || !env.BOT_TOKEN) return;
-  const jobs = await env.DB.prepare("SELECT id,text FROM broadcast_jobs WHERE status IN ('queued','sending') ORDER BY id LIMIT 5").all();
+  const jobs = await env.DB.prepare("SELECT id,text,translations_json FROM broadcast_jobs WHERE status IN ('queued','sending') ORDER BY id LIMIT 5").all();
   let remaining = Math.max(1,Math.min(50,limit));
   for (const job of jobs.results || []) {
     if (remaining <= 0) break;
+    let translations = {};
+    try { translations = JSON.parse(job.translations_json || "{}"); } catch (_) {}
     const recipients = await env.DB.prepare("SELECT id,chat_id FROM broadcast_recipients WHERE job_id=?1 AND status='queued' ORDER BY id LIMIT ?2").bind(job.id, remaining).all();
     remaining -= (recipients.results || []).length;
     for (let i=0;i<(recipients.results||[]).length;i+=10) {
       await Promise.all(recipients.results.slice(i,i+10).map(async rec => {
         try {
-          const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:rec.chat_id,text:job.text}) }, FETCH_TIMEOUT_MS);
+          const recipientUser = await readUser(env, `user:${rec.chat_id}`);
+          const rawRecipientLanguage = String(recipientUser && recipientUser.lang || "").toLowerCase().slice(0, 2);
+          const recipientLanguage = ["ru", "uk", "en"].includes(rawRecipientLanguage) ? rawRecipientLanguage : "ru";
+          const recipientText = String(translations[recipientLanguage] || translations.ru || job.text);
+          const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:rec.chat_id,text:recipientText}) }, FETCH_TIMEOUT_MS);
           const j = await r.json().catch(()=>({}));
           await env.DB.prepare("UPDATE broadcast_recipients SET status=?1,error=?2,sent_at=?3 WHERE id=?4").bind(r.ok&&j.ok?"sent":"failed",r.ok&&j.ok?null:String(j.description||`HTTP ${r.status}`).slice(0,300),r.ok&&j.ok?new Date().toISOString():null,rec.id).run();
           if (r.ok && j.ok && j.result) await savePanelMessage(env,j.result.chat,j.result,"out",j.result.from||null);
@@ -1428,9 +1469,9 @@ async function startSimulation(env, body) {
     .bind(scopeKey,oblast,district||null,state,new Date(now).toISOString(),expires?new Date(expires).toISOString():null).run();
   const area = district ? `${OBLAST_NAMES_UK[oblast]} · ${DISTRICT_NAMES_UK[`${oblast}:${district}`]}` : OBLAST_NAMES_UK[oblast];
   const stateText = state === "red" ? "🔴 Симулирована тревога" : state === "yellow" ? "🟡 Симулирован жёлтый уровень" : "🟢 Симулирован отбой";
-  try { await createBroadcast(env,{text:`
+  try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ — не является реальным оповещением alerts.in.ua
 ${stateText}
-${area}`,audience:{type:district?"district":"oblast",oblast_key:oblast,district_key:district},confirm:true}); }
+${area}`,audience:{type:district?"district":"oblast",oblast_key:oblast,district_key:district},translate:false,confirm:true}); }
   catch(e) { console.error("[simulation] Telegram test notification queue failed:",e); }
   return { ok:true, id:Number(ins.meta&&ins.meta.last_row_id)||null, scope_key:scopeKey, state, started_at:new Date(now).toISOString(), expires_at:expires?new Date(expires).toISOString():null };
 }
@@ -1441,9 +1482,9 @@ async function expireSimulations(env) {
     const changed = await env.DB.prepare("UPDATE simulations SET active=0,ended_at=?1 WHERE id=?2 AND active=1").bind(now,sim.id).run();
     if (changed.meta && changed.meta.changes && sim.state !== "green") {
       const area = sim.district_key ? `${OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key} · ${DISTRICT_NAMES_UK[`${sim.oblast_key}:${sim.district_key}`]||sim.district_key}` : (OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key);
-      try { await createBroadcast(env,{text:`
+      try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ ЗАВЕРШЕНА
 🟢 Симулирован отбой
-${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},confirm:true}); }
+${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},translate:false,confirm:true}); }
       catch(e) { console.error("[simulation] expiry notification queue failed:",e); }
     }
   }
@@ -1459,9 +1500,9 @@ async function stopSimulation(env, id) {
   const r = await env.DB.prepare("UPDATE simulations SET active=0,ended_at=?1 WHERE id=?2 AND active=1").bind(new Date().toISOString(),Number(id)).run();
   if (sim && r.meta && r.meta.changes && sim.state !== "green") {
     const area = sim.district_key ? `${OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key} · ${DISTRICT_NAMES_UK[`${sim.oblast_key}:${sim.district_key}`]||sim.district_key}` : (OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key);
-    try { await createBroadcast(env,{text:`
+    try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ ЗАВЕРШЕНА
 🟢 Симулирован отбой
-${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},confirm:true}); }
+${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},translate:false,confirm:true}); }
     catch(e) { console.error("[simulation] stop notification queue failed:",e); }
   }
   return { ok: true, changes: r.meta && r.meta.changes || 0 };
@@ -1488,7 +1529,7 @@ function panelHtml() {
       return;
     }
     if(tab==='broadcast'){
-      m.innerHTML=back+'<h2>Broadcast</h2><p class="muted">Рассылка отправляется только после предпросмотра и подтверждения.</p><label>Аудитория<select id="aud"><option value="all">Все зарегистрированные</option><option value="telegram">Telegram-подключённые</option><option value="oblast">Область</option><option value="district">Район</option><option value="version">Версия плагина</option></select></label><input id="oblast" placeholder="oblast_key"><input id="district" placeholder="district_key"><input id="vp" placeholder="Префикс версии, например 1.1."><textarea id="bt" placeholder="Текст рассылки"></textarea><button onclick="previewBroadcast()">Предпросмотр</button><pre id="out"></pre>';
+      m.innerHTML=back+'<h2>Рассылка</h2><p class="muted">Напиши сообщение один раз. Worker переведёт его на русский, украинский и английский. Проверь все варианты до подтверждения.</p><label>Язык исходного текста<select id="sourceLang"><option value="auto">Определить автоматически</option><option value="ru">Русский</option><option value="uk">Українська</option><option value="en">English</option></select></label><label>Аудитория<select id="aud"><option value="all">Все зарегистрированные</option><option value="telegram">Telegram-подключённые</option><option value="oblast">Область</option><option value="district">Район</option><option value="version">Версия плагина</option></select></label><input id="oblast" placeholder="oblast_key"><input id="district" placeholder="district_key"><input id="vp" placeholder="Префикс версии, например 1.1."><textarea id="bt" placeholder="Текст рассылки"></textarea><button onclick="previewBroadcast()">Перевести и показать предпросмотр</button><pre id="out"></pre>';
       return;
     }
     if(tab==='sim'){
@@ -1503,7 +1544,7 @@ function panelHtml() {
     }
   }
   async function userLookup(){try{$('out').textContent=JSON.stringify(await api('/admin/users/'+encodeURIComponent($('uid').value)),null,2)}catch(e){$('out').textContent=e.message}}
-  let broadcastPreview=null;async function previewBroadcast(){try{const audience={type:$('aud').value,oblast_key:$('oblast').value.trim(),district_key:$('district').value.trim(),version_prefix:$('vp').value.trim()};broadcastPreview={text:$('bt').value,audience};const j=await api('/admin/broadcast/preview',{method:'POST',body:JSON.stringify(broadcastPreview)});$('out').textContent='Получателей: '+j.count+'\\n'+JSON.stringify(j.audience,null,2)+'\\n\\n'+broadcastPreview.text+'\\n\\nПосле проверки нажми «Подтвердить рассылку».';const b=document.createElement('button');b.textContent='Подтвердить рассылку';b.onclick=async()=>{if(!confirm('Отправить сообщение '+j.count+' получателям?'))return;try{$('out').textContent=JSON.stringify(await api('/admin/broadcast/create',{method:'POST',body:JSON.stringify({...broadcastPreview,confirm:true})}),null,2)}catch(e){$('out').textContent=e.message}};$('out').after(b)}catch(e){$('out').textContent=e.message}}
+  let broadcastPreview=null;async function previewBroadcast(){try{const audience={type:$('aud').value,oblast_key:$('oblast').value.trim(),district_key:$('district').value.trim(),version_prefix:$('vp').value.trim()};broadcastPreview={text:$('bt').value,source_language:$('sourceLang').value,audience};$('out').textContent='Перевожу сообщение…';const j=await api('/admin/broadcast/preview',{method:'POST',body:JSON.stringify(broadcastPreview)});broadcastPreview.translations=j.translations;const t=j.translations||{};$('out').textContent='Получателей: '+j.count+'\nАудитория: '+JSON.stringify(j.audience)+'\n\n🇷🇺 РУССКИЙ\n'+(t.ru||'')+'\n\n🇺🇦 УКРАЇНСЬКА\n'+(t.uk||'')+'\n\n🇬🇧 ENGLISH\n'+(t.en||'')+'\n\nПроверь все варианты. Для отправки нажми кнопку ниже.';let old=document.getElementById('confirmBroadcast');if(old)old.remove();const b=document.createElement('button');b.id='confirmBroadcast';b.textContent='Подтвердить рассылку';b.onclick=async()=>{if(!confirm('Отправить локализованную рассылку '+j.count+' получателям?'))return;b.disabled=true;try{$('out').textContent=JSON.stringify(await api('/admin/broadcast/create',{method:'POST',body:JSON.stringify({...broadcastPreview,confirm:true})}),null,2)}catch(e){$('out').textContent=e.message;b.disabled=false}};$('out').after(b)}catch(e){$('out').textContent='Ошибка перевода/предпросмотра: '+e.message}}
   function updateDistrictOptions(){const oblast=$('so')?.value||'';const district=$('sd');if(!district)return;const current=district.value;const options=Object.entries(DISTRICT_NAMES).filter(([k])=>k.startsWith(oblast+':')).map(([k,v])=>[k.slice(oblast.length+1),v]);district.innerHTML='<option value="">Вся область</option>'+options.map(([k,v])=>'<option value="'+esc(k)+'">'+esc(v)+'</option>').join('');if(options.some(([k])=>k===current))district.value=current;district.disabled=!oblast||options.length===0}
   async function startSim(){try{if(!$('so').value){$('out').textContent='Сначала выбери область.';return}$('out').textContent=JSON.stringify(await api('/admin/simulations',{method:'POST',body:JSON.stringify({oblast_key:$('so').value,district_key:$('sd').value,state:$('ss').value,duration_seconds:$('dur').value==='manual'?'manual':Number($('dur').value)})}),null,2);await refreshSims()}catch(e){$('out').textContent=e.message}}
   async function refreshSims(){try{const j=await api('/admin/simulations');$('simlist').innerHTML=(j.simulations||[]).filter(s=>s.active).map(s=>'<p>'+esc(s.scope_key)+' · '+esc(s.state)+' · '+esc(s.expires_at||'до ручного отбоя')+' <button class="danger" onclick="stopSim('+s.id+')">Отбой</button></p>').join('')||'<p class="muted">Активных симуляций нет</p>'}catch(e){$('simlist').textContent=e.message}}
@@ -1569,7 +1610,7 @@ async function handleAdmin(request, env, url) {
     } catch(e) { return adminJson({error:String(e)},500); }
   }
   if (p === "/admin/broadcast/preview" && request.method === "POST") {
-    try { return adminJson(await createBroadcast(env,{...(await request.json()),preview:true})); } catch(e) { return adminJson({error:String(e)},500); }
+    try { const out = await createBroadcast(env,{...(await request.json()),preview:true}); return adminJson(out,out.status||200); } catch(e) { return adminJson({error:String(e)},500); }
   }
   if (p === "/admin/broadcast/create" && request.method === "POST") {
     try { const out=await createBroadcast(env,await request.json()); return adminJson(out,out.status||200); } catch(e) { return adminJson({error:String(e)},500); }
