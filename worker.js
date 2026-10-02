@@ -1318,7 +1318,18 @@ async function savePanelMessage(env, chat, message, direction, from = null) {
 }
 async function syncKnownUsersToPanel(env) {
   if (!env.DB || !env.USERS) return;
-  try { if (await d1GetKV(env.DB, "panel-users-synced")) return; } catch (_) {}
+  try {
+    const synced = await d1GetKV(env.DB, "panel-users-synced");
+    if (synced) {
+      // The flag can get set even when nothing actually landed in
+      // panel_chats (e.g. it ran once before the panel tables existed,
+      // so every INSERT inside the loop below failed and was swallowed).
+      // Don't trust the flag alone — confirm there's real data behind it,
+      // otherwise resync once so existing KV users actually show up.
+      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM panel_chats").first();
+      if (row && row.n > 0) return;
+    }
+  } catch (_) {}
   let cursor;
   do {
     const page = await env.USERS.list({ prefix: "user:", limit: 500, ...(cursor ? { cursor } : {}) });
