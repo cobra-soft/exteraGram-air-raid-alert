@@ -902,12 +902,7 @@ async function sendTelegramDetailed(botToken, chatId, text) {
 }
 
 async function sendTelegramTracked(env, chatId, text) {
-  const result = await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
-  if (result.ok && result.result) {
-    try { await savePanelMessage(env, result.result.chat, result.result, "out", result.result.from || null); }
-    catch (e) { console.error("[panel] outgoing message save failed:", e); }
-  }
-  return result;
+  return await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
 }
 
 async function readUser(env, key) {
@@ -1003,7 +998,20 @@ async function handleTelegramWebhookInner(request, env) {
 
   const message = update.message || update.channel_post || update.edited_message || update.edited_channel_post;
   if (!message || !message.chat) return json({ ok: true });
-  await savePanelMessage(env, message.chat, message, "in", message.from || null);
+  if (message.chat.type === "private" && message.from && message.from.id != null && String(message.from.id) === String(message.chat.id)) {
+    try {
+      const key = `user:${message.chat.id}`;
+      const user = await readUser(env, key);
+      if (user) await writeUser(env, key, {
+        ...user,
+        telegram_username: message.from.username || user.telegram_username || null,
+        telegram_first_name: message.from.first_name || user.telegram_first_name || null,
+        telegram_last_name: message.from.last_name || user.telegram_last_name || null,
+        last_activity: new Date().toISOString(),
+        telegram_connected: true
+      });
+    } catch (e) { console.error("[telegram] user activity update failed:", e); }
+  }
   if (!message.text) return json({ ok: true });
 
   const chatId = message.chat.id;
@@ -1037,7 +1045,7 @@ async function handleTelegramWebhookInner(request, env) {
     // getSharedSnapshot()/alertStatus() the plugin and the notifier use, so
     // it's always consistent with what the bot would otherwise push.
     const user = await readUser(env, `user:${chatId}`);
-    const lang = user ? normLang(user.lang) : normLang(message.from && message.from.language_code);
+    const lang = normLang(message.from && message.from.language_code || (user && user.lang));
     const m = M(lang);
     if (!user || !user.oblast_key) {
       await sendTelegramTracked(env, chatId, m.statusNoRegion);
@@ -1045,9 +1053,7 @@ async function handleTelegramWebhookInner(request, env) {
       try {
         const snapshot = await getSharedSnapshot(env);
         const status = alertStatus(snapshot.data, user.oblast_key, user.district_key);
-        const header = m.statusHeader(user.region_name || user.oblast_key);
-        const body = stateMessage(user.region_name || user.oblast_key, status, lang);
-        await sendTelegramTracked(env, chatId, `${header}\n${body}`);
+        await sendTelegramTracked(env, chatId, stateMessage(user.region_name || user.oblast_key, status, lang));
       } catch (e) {
         console.error("[status] on-demand status failed:", e);
       }
@@ -1246,148 +1252,6 @@ async function adminData(env, request, full, kvTest, probeUp) {
 }
 
 
-// ───────────────────────── PANEL DATA ─────────────────────────
-// New panel tables are additive; existing KV user records and cache_kv are untouched.
-function panelText(message) {
-  if (!message) return "";
-  if (typeof message.text === "string") return message.text;
-  if (typeof message.caption === "string") return message.caption;
-  if (message.photo) return "[Фото]";
-  if (message.video) return "[Видео]";
-  if (message.document) return `[Документ: ${message.document.file_name || "без названия"}]`;
-  if (message.voice) return "[Голосовое сообщение]";
-  if (message.audio) return "[Аудио]";
-  if (message.sticker) return `[Стикер ${message.sticker.emoji || ""}]`;
-  if (message.location) return "[Геопозиция]";
-  if (message.contact) return "[Контакт]";
-  return "[Сообщение]";
-}
-function panelMessageType(message) {
-  if (!message) return "unknown";
-  for (const k of ["text","photo","video","document","voice","audio","sticker","location","contact","animation","video_note","venue","poll","dice"])
-    if (message[k] !== undefined) return k;
-  return "unknown";
-}
-async function upsertPanelChat(env, chat, message, direction = "in") {
-  if (!env.DB || !chat || chat.id === undefined || chat.id === null) return;
-  const chatId = String(chat.id), now = new Date().toISOString();
-  const preview = panelText(message).slice(0, 500);
-  const msgDate = message && message.date ? Number(message.date) : Math.floor(Date.now() / 1000);
-  const title = chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username || null;
-  try {
-    await env.DB.prepare(`INSERT INTO panel_chats
-      (chat_id, chat_type, title, username, first_name, last_name, last_message_id, last_message_at, last_message_text, updated_at, source)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-      ON CONFLICT(chat_id) DO UPDATE SET
-      chat_type=excluded.chat_type, title=COALESCE(excluded.title,panel_chats.title),
-      username=COALESCE(excluded.username,panel_chats.username), first_name=COALESCE(excluded.first_name,panel_chats.first_name),
-      last_name=COALESCE(excluded.last_name,panel_chats.last_name),
-      last_message_id=COALESCE(excluded.last_message_id,panel_chats.last_message_id),
-      last_message_at=CASE WHEN excluded.last_message_at IS NOT NULL AND (panel_chats.last_message_at IS NULL OR excluded.last_message_at >= panel_chats.last_message_at) THEN excluded.last_message_at ELSE panel_chats.last_message_at END,
-      last_message_text=CASE WHEN excluded.last_message_at IS NOT NULL AND (panel_chats.last_message_at IS NULL OR excluded.last_message_at >= panel_chats.last_message_at) THEN excluded.last_message_text ELSE panel_chats.last_message_text END,
-      updated_at=excluded.updated_at, source=excluded.source`).bind(
-      chatId, chat.type || "unknown", title, chat.username || null, chat.first_name || null, chat.last_name || null,
-      message && message.message_id != null ? Number(message.message_id) : null,
-      message && message.date ? Number(message.date) : null, message ? preview : null, now, direction
-    ).run();
-  } catch (e) { console.error("[panel] chat upsert failed:", e); }
-}
-async function savePanelMessage(env, chat, message, direction, from = null) {
-  if (!env.DB || !chat || !message) return;
-  await upsertPanelChat(env, chat, message, direction);
-  if (message.message_id == null) return;
-  try {
-    await env.DB.prepare(`INSERT INTO panel_messages
-      (chat_id, message_id, direction, from_id, from_username, text, message_type, telegram_date, created_at, raw_json)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-      ON CONFLICT(chat_id, message_id) DO NOTHING`).bind(
-      String(chat.id), Number(message.message_id), direction,
-      from && from.id != null ? String(from.id) : null,
-      from && from.username ? String(from.username) : null,
-      panelText(message), panelMessageType(message), Number(message.date || Math.floor(Date.now()/1000)),
-      new Date().toISOString(), JSON.stringify(message)
-    ).run();
-  } catch (e) { console.error("[panel] message save failed:", e); }
-  if (direction === "in" && chat.type === "private" && from && from.id != null && String(from.id) === String(chat.id)) {
-    try {
-      const key = `user:${chat.id}`;
-      const user = await readUser(env, key);
-      if (user) await writeUser(env, key, { ...user, telegram_username: from.username || user.telegram_username || null, telegram_first_name: from.first_name || user.telegram_first_name || null, telegram_last_name: from.last_name || user.telegram_last_name || null, last_activity: new Date().toISOString(), telegram_connected: true });
-    } catch (e) { console.error("[panel] user activity update failed:", e); }
-  }
-}
-async function syncKnownUsersToPanel(env) {
-  if (!env.DB || !env.USERS) return;
-  try {
-    const synced = await d1GetKV(env.DB, "panel-users-synced");
-    if (synced) {
-      // The flag can get set even when nothing actually landed in
-      // panel_chats (e.g. it ran once before the panel tables existed,
-      // so every INSERT inside the loop below failed and was swallowed).
-      // Don't trust the flag alone — confirm there's real data behind it,
-      // otherwise resync once so existing KV users actually show up.
-      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM panel_chats").first();
-      if (row && row.n > 0) return;
-    }
-  } catch (_) {}
-  let cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 500, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const u = item.metadata || await readUser(env, item.name);
-      if (!u || !u.chat_id) continue;
-      const id = String(u.chat_id);
-      try {
-        await env.DB.prepare(`INSERT INTO panel_chats (chat_id,chat_type,title,username,first_name,last_name,updated_at,source)
-          VALUES (?1,'private',?2,?3,?4,?5,?6,'kv-sync') ON CONFLICT(chat_id) DO UPDATE SET
-          title=COALESCE(panel_chats.title,excluded.title), username=COALESCE(panel_chats.username,excluded.username)`)
-          .bind(id, [u.telegram_first_name,u.telegram_last_name].filter(Boolean).join(" ") || u.telegram_username || id, u.telegram_username || null, u.telegram_first_name || null, u.telegram_last_name || null, new Date().toISOString()).run();
-      } catch (e) { console.error("[panel] KV sync failed:", e); }
-    }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
-  await d1PutKV(env.DB, "panel-users-synced", "1");
-}
-async function listPanelChats(env, url) {
-  await syncKnownUsersToPanel(env);
-  const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
-  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
-  const before = url.searchParams.get("before") || null;
-  let stmt = `SELECT c.*, (SELECT COUNT(*) FROM panel_messages m WHERE m.chat_id=c.chat_id) AS message_count
-    FROM panel_chats c`;
-  const args = [];
-  const where = [];
-  if (q) { where.push("(c.title LIKE ? OR c.username LIKE ? OR c.chat_id LIKE ?)"); args.push(`%${q}%`,`%${q}%`,`%${q}%`); }
-  if (before) { where.push("COALESCE(c.last_message_at,0) < ?"); args.push(Number(before)); }
-  if (where.length) stmt += " WHERE " + where.join(" AND ");
-  stmt += " ORDER BY COALESCE(c.last_message_at,0) DESC, c.updated_at DESC LIMIT ?"; args.push(limit);
-  const result = await env.DB.prepare(stmt).bind(...args).all();
-  return { ok: true, chats: result.results || [] };
-}
-async function listPanelMessages(env, chatId, url) {
-  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
-  const before = url.searchParams.get("before");
-  let sql = "SELECT * FROM panel_messages WHERE chat_id=?1";
-  const args = [String(chatId)];
-  if (before) { sql += " AND id < ?2"; args.push(Number(before)); }
-  sql += ` ORDER BY id DESC LIMIT ?${args.length + 1}`; args.push(limit);
-  const r = await env.DB.prepare(sql).bind(...args).all();
-  return { ok: true, messages: (r.results || []).reverse() };
-}
-async function sendPanelMessage(env, chatId, body) {
-  const text = String(body.text || "").trim();
-  if (!text) return { error: "empty_message" , status: 400 };
-  if (text.length > 4096) return { error: "message_too_long", status: 400 };
-  if (!env.BOT_TOKEN) return { error: "BOT_TOKEN not configured", status: 500 };
-  const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: String(chatId), text })
-  }, FETCH_TIMEOUT_MS);
-  const result = await r.json().catch(() => ({}));
-  if (!r.ok || !result.ok || !result.result) return { error: result.description || `Telegram HTTP ${r.status}`, status: r.status || 502 };
-  await savePanelMessage(env, result.result.chat, result.result, "out", { id: result.result.from && result.result.from.id, username: result.result.from && result.result.from.username });
-  return { ok: true, message: result.result };
-}
 function versionCompare(a, b) {
   const pa = String(a || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
   const pb = String(b || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
@@ -1501,7 +1365,6 @@ async function processBroadcastBatch(env, limit = 20) {
           const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:rec.chat_id,text:recipientText}) }, FETCH_TIMEOUT_MS);
           const j = await r.json().catch(()=>({}));
           await env.DB.prepare("UPDATE broadcast_recipients SET status=?1,error=?2,sent_at=?3 WHERE id=?4").bind(r.ok&&j.ok?"sent":"failed",r.ok&&j.ok?null:String(j.description||`HTTP ${r.status}`).slice(0,300),r.ok&&j.ok?new Date().toISOString():null,rec.id).run();
-          if (r.ok && j.ok && j.result) await savePanelMessage(env,j.result.chat,j.result,"out",j.result.from||null);
         } catch(e) {
           await env.DB.prepare("UPDATE broadcast_recipients SET status='failed',error=?1 WHERE id=?2").bind(String(e).slice(0,300),rec.id).run();
         }
@@ -1565,53 +1428,6 @@ ${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.obla
   }
   return { ok: true, changes: r.meta && r.meta.changes || 0 };
 }
-function panelHtml() {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Air Raid Admin Console</title><style>
-  *{box-sizing:border-box}body{margin:0;background:#101318;color:#e8edf5;font:14px system-ui}button,input,textarea,select{font:inherit}button{cursor:pointer;background:#2a6df4;color:white;border:0;border-radius:9px;padding:10px 14px}.app{display:grid;grid-template-columns:300px 1fr;height:100dvh}.side{border-right:1px solid #303743;display:flex;flex-direction:column;min-height:0}.head{padding:16px;border-bottom:1px solid #303743;font-size:18px;font-weight:700}.tools{padding:10px;display:flex;gap:8px;flex-wrap:wrap}.tools button{padding:8px;font-size:12px}.search{margin:0 10px 10px;padding:10px;border-radius:10px;border:1px solid #303743;background:#191e27;color:white}.chats{overflow:auto;flex:1}.chat{padding:12px;border-top:1px solid #252b35;cursor:pointer}.chat:hover,.chat.on{background:#202938}.chat b{display:block}.chat small{color:#9ba7b9}.main{display:flex;flex-direction:column;min-width:0}.bar{padding:14px 18px;border-bottom:1px solid #303743;display:flex;justify-content:space-between;gap:10px}.msgs{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:8px}.msg{max-width:min(78%,620px);padding:10px 12px;border-radius:12px;background:#252c37;white-space:pre-wrap;overflow-wrap:anywhere}.msg.out{align-self:flex-end;background:#174b78}.msg small{display:block;color:#b3c0d2;font-size:10px;margin-top:5px}.send{display:flex;gap:8px;padding:12px;border-top:1px solid #303743}.send textarea{flex:1;resize:vertical;min-height:44px;max-height:140px;background:#191e27;color:white;border:1px solid #303743;border-radius:10px;padding:10px}.empty{margin:auto;color:#9ba7b9;text-align:center;padding:24px}.modal{position:fixed;inset:0;z-index:20;background:#101318;padding:18px;overflow:auto}.modal input,.modal textarea,.modal select{display:block;width:100%;margin:8px 0 12px;background:#191e27;color:white;border:1px solid #303743;border-radius:8px;padding:10px}.muted{color:#9ba7b9}.hidden{display:none}.row{display:flex;gap:8px;flex-wrap:wrap}.danger{background:#9b2d39}@media(max-width:700px){.app{grid-template-columns:115px 1fr}.head{font-size:14px;padding:12px}.tools{padding:5px}.tools button{padding:7px 5px}.search{width:calc(100% - 12px);margin:0 6px 8px}.chat{padding:9px}.chat small{display:none}.bar{padding:10px}.msgs{padding:10px}.msg{max-width:90%}}
-  </style></head><body><div class="app"><aside class="side"><div class="head">Air Raid Console</div><div class="tools"><button onclick="showTab('chats')">Чаты</button><button onclick="showTab('users')">Юзеры</button><button onclick="showTab('broadcast')">Рассылка</button><button onclick="showTab('sim')">Симуляция</button><button onclick="showTab('version')">Версия</button></div><input class="search" id="q" placeholder="Поиск чата" oninput="loadChats()"><div class="chats" id="chats"><div class="empty">Загрузка…</div></div></aside><section class="main"><div class="bar"><div><b id="title">Выбери чат</b><div class="muted" id="subtitle">Сообщения от имени бота</div></div><a href="/admin" style="color:#9fbfff">Старая админка</a></div><div class="msgs" id="msgs"><div class="empty">Выбери чат слева</div></div><form class="send" id="sendForm"><textarea id="text" placeholder="Сообщение…" disabled></textarea><button id="sendBtn" disabled>Отправить</button></form></section></div><div class="modal hidden" id="modal"></div><script>
-  const OBLAST_NAMES = ${JSON.stringify(OBLAST_NAMES_UK)};
-  const DISTRICT_NAMES = ${JSON.stringify(DISTRICT_NAMES_UK)};
-  const $=id=>document.getElementById(id);let selected=null,chatData=[];
-  async function api(path,opts={}){const r=await fetch(path,{cache:'no-store',...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});const j=await r.json().catch(()=>({}));if(!r.ok||j.error)throw Error(j.error||('HTTP '+r.status));return j}
-  function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-  async function loadChats(){try{const j=await api('/admin/chats?q='+encodeURIComponent($('q').value));chatData=j.chats||[];$('chats').innerHTML=chatData.map(c=>\`<div class="chat \${String(c.chat_id)===String(selected)?'on':''}" onclick="openChat('\${esc(c.chat_id)}')"><b>\${esc(c.title||c.chat_id)}</b><small>\${esc(c.last_message_text||c.chat_type||'Чат')} · \${c.message_count||0}</small></div>\`).join('')||'<div class="empty">Нет известных чатов</div>'}catch(e){$('chats').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
-  async function openChat(id){selected=id;const c=chatData.find(x=>String(x.chat_id)===String(id));$('title').textContent=c?(c.title||id):id;$('subtitle').textContent='chat_id: '+id;$('text').disabled=false;$('sendBtn').disabled=false;loadChats();try{const j=await api('/admin/chats/'+encodeURIComponent(id)+'/messages');$('msgs').innerHTML=(j.messages||[]).map(m=>\`<div class="msg \${m.direction==='out'?'out':''}">\${esc(m.text)}<small>\${m.direction==='out'?'Бот':'Входящее'} · \${new Date((m.telegram_date||0)*1000).toLocaleString()}</small></div>\`).join('')||'<div class="empty">Сохранённых сообщений пока нет. Старую историю Bot API не выдаёт.</div>';$('msgs').scrollTop=$('msgs').scrollHeight}catch(e){$('msgs').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
-  $('sendForm').onsubmit=async e=>{e.preventDefault();if(!selected)return;const text=$('text').value.trim();if(!text)return;$('sendBtn').disabled=true;try{await api('/admin/chats/'+encodeURIComponent(selected)+'/messages',{method:'POST',body:JSON.stringify({text})});$('text').value='';await openChat(selected)}catch(err){alert(err.message)}finally{$('sendBtn').disabled=false}};
-  function showTab(tab){
-    const m=$('modal');
-    m.classList.remove('hidden');
-    if(tab==='chats'){m.classList.add('hidden');return}
-    const back='<div style="position:sticky;top:-18px;background:#101318;padding:0 0 14px;z-index:2"><button onclick="showTab(&quot;chats&quot;)" aria-label="Назад">← Назад</button></div>';
-    if(tab==='users'){
-      m.innerHTML=back+'<h2>Карточка пользователя</h2><input id="uid" placeholder="Telegram ID"><button onclick="userLookup()">Найти</button><pre id="out"></pre>';
-      return;
-    }
-    if(tab==='broadcast'){
-      m.innerHTML=back+'<h2>Рассылка</h2><p class="muted">Напиши сообщение один раз. Worker переведёт его на русский, украинский и английский. Проверь все варианты до подтверждения.</p><label>Язык исходного текста<select id="sourceLang"><option value="auto">Определить автоматически</option><option value="ru">Русский</option><option value="uk">Українська</option><option value="en">English</option></select></label><label>Аудитория<select id="aud"><option value="all">Все зарегистрированные</option><option value="telegram">Telegram-подключённые</option><option value="oblast">Область</option><option value="district">Район</option><option value="version">Версия плагина</option></select></label><input id="oblast" placeholder="oblast_key"><input id="district" placeholder="district_key"><input id="vp" placeholder="Префикс версии, например 1.1."><textarea id="bt" placeholder="Текст рассылки"></textarea><button onclick="previewBroadcast()">Перевести и показать предпросмотр</button><pre id="out"></pre>';
-      return;
-    }
-    if(tab==='sim'){
-      m.innerHTML=back+'<h2>Симуляция тревоги (тестовая)</h2><label>Область<select id="so" onchange="updateDistrictOptions()"><option value="">Выбери область…</option>'+Object.entries(OBLAST_NAMES).map(([k,v])=>'<option value="'+esc(k)+'">'+esc(v)+'</option>').join('')+'</select></label><label>Район (необязательно)<select id="sd"><option value="">Вся область</option></select></label><label>Статус<select id="ss"><option value="red">🔴 Тревога</option><option value="yellow">🟡 Жёлтый уровень</option><option value="green">🟢 Отбой</option></select></label><label>Длительность<select id="dur"><option value="30">30 секунд</option><option value="60">1 минута</option><option value="300">5 минут</option><option value="manual">До ручного отбоя</option></select></label><div class="row"><button onclick="startSim()">Запустить симуляцию</button><button onclick="refreshSims()">Активные симуляции</button></div><div id="simlist"></div><pre id="out"></pre>';
-      updateDistrictOptions();
-      return;
-    }
-    if(tab==='version'){
-      m.innerHTML=back+'<h2>Версия плагина</h2><label style="display:block;margin:12px 0"><input id="checkEnabled" type="checkbox" style="display:inline;width:auto;margin-right:8px">Включить проверку обновлений для совместимых версий плагина</label><p class="muted">По умолчанию выключено. Старый плагин 1.2.0 не начнёт показывать плашки без собственного обновления.</p><input id="latest" placeholder="latest_version"><input id="minimum" placeholder="minimum_version"><input id="updateUrl" type="url" placeholder="Ссылка на обновление (https://t.me/…)"><textarea id="change" placeholder="Changelog"></textarea><button onclick="saveVersion()">Сохранить</button><pre id="out"></pre>';
-      api('/admin/version').then(v=>{if(v.latest_version)$('latest').value=v.latest_version;if(v.minimum_version)$('minimum').value=v.minimum_version;$('updateUrl').value=v.update_url||'https://t.me/excess_plugins/100';$('change').value=v.changelog||'';$('checkEnabled').checked=!!v.update_check_enabled}).catch(e=>{$('out').textContent=e.message});
-      return;
-    }
-  }
-  async function userLookup(){try{$('out').textContent=JSON.stringify(await api('/admin/users/'+encodeURIComponent($('uid').value)),null,2)}catch(e){$('out').textContent=e.message}}
-  let broadcastPreview=null;async function previewBroadcast(){try{const audience={type:$('aud').value,oblast_key:$('oblast').value.trim(),district_key:$('district').value.trim(),version_prefix:$('vp').value.trim()};broadcastPreview={text:$('bt').value,source_language:$('sourceLang').value,audience};$('out').textContent='Перевожу сообщение…';const j=await api('/admin/broadcast/preview',{method:'POST',body:JSON.stringify(broadcastPreview)});broadcastPreview.translations=j.translations;const t=j.translations||{};$('out').textContent='Получателей: '+j.count+'\\nАудитория: '+JSON.stringify(j.audience)+'\\n\\n🇷🇺 РУССКИЙ\\n'+(t.ru||'')+'\\n\\n🇺🇦 УКРАЇНСЬКА\\n'+(t.uk||'')+'\\n\\n🇬🇧 ENGLISH\\n'+(t.en||'')+'\\n\\nПроверь все варианты. Для отправки нажми кнопку ниже.';let old=document.getElementById('confirmBroadcast');if(old)old.remove();const b=document.createElement('button');b.id='confirmBroadcast';b.textContent='Подтвердить рассылку';b.onclick=async()=>{if(!confirm('Отправить локализованную рассылку '+j.count+' получателям?'))return;b.disabled=true;try{$('out').textContent=JSON.stringify(await api('/admin/broadcast/create',{method:'POST',body:JSON.stringify({...broadcastPreview,confirm:true})}),null,2)}catch(e){$('out').textContent=e.message;b.disabled=false}};$('out').after(b)}catch(e){$('out').textContent='Ошибка перевода/предпросмотра: '+e.message}}
-  function updateDistrictOptions(){const oblast=$('so')?.value||'';const district=$('sd');if(!district)return;const current=district.value;const options=Object.entries(DISTRICT_NAMES).filter(([k])=>k.startsWith(oblast+':')).map(([k,v])=>[k.slice(oblast.length+1),v]);district.innerHTML='<option value="">Вся область</option>'+options.map(([k,v])=>'<option value="'+esc(k)+'">'+esc(v)+'</option>').join('');if(options.some(([k])=>k===current))district.value=current;district.disabled=!oblast||options.length===0}
-  async function startSim(){try{if(!$('so').value){$('out').textContent='Сначала выбери область.';return}$('out').textContent=JSON.stringify(await api('/admin/simulations',{method:'POST',body:JSON.stringify({oblast_key:$('so').value,district_key:$('sd').value,state:$('ss').value,duration_seconds:$('dur').value==='manual'?'manual':Number($('dur').value)})}),null,2);await refreshSims()}catch(e){$('out').textContent=e.message}}
-  async function refreshSims(){try{const j=await api('/admin/simulations');$('simlist').innerHTML=(j.simulations||[]).filter(s=>s.active).map(s=>'<p>'+esc(s.scope_key)+' · '+esc(s.state)+' · '+esc(s.expires_at||'до ручного отбоя')+' <button class="danger" onclick="stopSim('+s.id+')">Отбой</button></p>').join('')||'<p class="muted">Активных симуляций нет</p>'}catch(e){$('simlist').textContent=e.message}}
-  async function stopSim(id){try{await api('/admin/simulations/'+id+'/stop',{method:'POST'});await refreshSims()}catch(e){alert(e.message)}}
-  async function saveVersion(){try{$('out').textContent=JSON.stringify(await api('/admin/version',{method:'POST',body:JSON.stringify({latest_version:$('latest').value,minimum_version:$('minimum').value,update_url:$('updateUrl').value,changelog:$('change').value,update_check_enabled:$('checkEnabled').checked})}),null,2)}catch(e){$('out').textContent=e.message}}
-  loadChats();setInterval(()=>{if(selected)openChat(selected);else loadChats()},15000);
-  </script></body></html>`;
-}
-
 async function handleAdmin(request, env, url) {
   const p = url.pathname;
   if (!env.ADMIN_TOKEN) return new Response("Admin disabled: set the ADMIN_TOKEN secret", { status: 404 });
@@ -1629,28 +1445,13 @@ async function handleAdmin(request, env, url) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  if (p === "/admin/console") return new Response(panelHtml(), { headers: {
-    "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
-    "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"
-  } });
-  if (p === "/admin/chats" && request.method === "GET") {
-    try { return adminJson(await listPanelChats(env, url)); } catch (e) { return adminJson({error:String(e)},500); }
-  }
-  const chatMessagesMatch = p.match(/^\/admin\/chats\/(-?\d+)\/messages$/);
-  if (chatMessagesMatch && request.method === "GET") {
-    try { return adminJson(await listPanelMessages(env, chatMessagesMatch[1], url)); } catch (e) { return adminJson({error:String(e)},500); }
-  }
-  if (chatMessagesMatch && request.method === "POST") {
-    try { const out = await sendPanelMessage(env, chatMessagesMatch[1], await request.json()); return adminJson(out, out.status || 200); } catch (e) { return adminJson({error:String(e)},500); }
-  }
   const userMatch = p.match(/^\/admin\/users\/(-?\d+)$/);
   if (userMatch && request.method === "GET") {
     const id = userMatch[1];
     const user = await readUser(env, `user:${id}`);
-    let chat = null; let latestError = null;
-    try { chat = await env.DB.prepare("SELECT * FROM panel_chats WHERE chat_id=?1").bind(id).first(); } catch (_) {}
+    let latestError = null;
     try { latestError = await env.DB.prepare("SELECT error,created_at FROM broadcast_recipients WHERE chat_id=?1 AND error IS NOT NULL ORDER BY id DESC LIMIT 1").bind(id).first(); } catch (_) {}
-    return adminJson({ok:true,telegram_id:id,profile:user||null,chat:chat||null,last_error:latestError,telegram_connected:!!(user && user.telegram_connected !== false)});
+    return adminJson({ok:true,telegram_id:id,profile:user||null,last_error:latestError,telegram_connected:!!(user && user.telegram_connected !== false)});
   }
   if (p === "/admin/version" && request.method === "GET") {
     try { return adminJson({ok:true, ...(await getPluginVersion(env))}); } catch(e) { return adminJson({error:String(e)},500); }
@@ -1786,8 +1587,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospa
 <div class="app">
 <nav class="rail" id="nav"></nav>
 <div class="main">
-<header class="top"><h1>Air Raid Worker<small id="sub"></small></h1><a href="/admin/console" style="color:#d0bcff;text-decoration:none;white-space:nowrap">Telegram / функции</a>
-<div class="sw on" id="auto" title="Автообновление 30с"><b>Авто</b><i></i></div>
+<header class="top"><h1>Air Raid Worker<small id="sub"></small></h1><div class="sw on" id="auto" title="Автообновление 30с"><b>Авто</b><i></i></div>
 <button class="ib" id="rf" title="Обновить"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button><button class="ib" id="lo" title="Выйти"><svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button></header>
 <div class="prog" id="prog"><i></i></div>
 <main class="view" id="view"></main>
@@ -2104,7 +1904,6 @@ export default {
         // Every register call used to cost a KV write even when nothing changed
         // (resume, resync...). KV free tier is 1000 writes/day, so skip it.
         if (!nothingChanged) await writeUser(env, key, userData);
-        if (!nothingChanged) await upsertPanelChat(env, { id: chat_id, type: "private", username: userData.telegram_username || null, first_name: userData.telegram_first_name || null, last_name: userData.telegram_last_name || null }, null, "register");
         const isNewDeviceLink = !!deviceLink;
         if (deviceLink) await env.USERS.delete(`device:${body.device_id}`);
 
