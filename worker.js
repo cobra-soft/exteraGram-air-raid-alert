@@ -2,11 +2,11 @@
 const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
-const EDGE_CACHE_TTL_SECONDS = 10; // plugin-facing /api cache; low so plugins see changes almost as fast as the bot
-const WORKER_VERSION = "air-raid-panel-2026-10-01"; // shown in /health so you can verify which file is deployed
-const SEND_CONCURRENCY = 15; // parallel Telegram sends (Telegram limit ~30 msg/s)
+const EDGE_CACHE_TTL_SECONDS = 10;
+const WORKER_VERSION = "air-raid-panel-2026-10-01";
+const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
-const RETRY_WINDOW_MS = 5 * 60 * 1000; // stop retrying failed deliveries after 5 min (old alerts are useless)
+const RETRY_WINDOW_MS = 5 * 60 * 1000;
 const SNAPSHOT_KEY = "alerts-in-ua";
 const DEVICE_LINK_TTL_SECONDS = 600;
 const UPDATE_DEDUP_TTL_SECONDS = 120;
@@ -209,11 +209,6 @@ function isValidAlerts(data) {
     Array.isArray(data.raions) && Array.isArray(data.oblasts);
 }
 
-// ───────────────────────── D1-backed key/value (replaces the old CACHE KV) ─────────────────────────
-// cache_kv is a 2-column table (key, value, updated_at) used as a drop-in
-// replacement for the handful of KV keys the CACHE namespace used to hold
-// (alerts-in-ua, cron-status, health-check). One row read/write per call,
-// same shape as the old cache.get/cache.put calls.
 async function d1GetKV(db, key) {
   try {
     const row = await db.prepare("SELECT value FROM cache_kv WHERE key = ?1").bind(key).first();
@@ -373,15 +368,6 @@ async function fetchUpstream(env) {
         started_at: alert.started_at
       };
     } else if (alert.location_type === 'raion') {
-      // IMPORTANT: for location_type === 'raion', alerts.in.ua puts the
-      // raion's own name in location_title, not location_raion.
-      // location_raion is only populated on sub-raion entries (hromada,
-      // city) where it names the *parent* raion. The old code checked
-      // `alert.location_raion`, which is undefined on raion-type alerts,
-      // so every district-level air raid alert fell through to the
-      // "unmapped location_type" branch below and was silently dropped —
-      // raions[] was always empty and district-subscribed users never got
-      // notified, no matter how many real raion alerts were active.
       const raionName = alert.location_raion || alert.location_title;
       if (!raionName) {
         console.error(`[alerts.in.ua] raion alert with no name (id ${alert.id}) in ${alert.location_oblast}`);
@@ -401,9 +387,6 @@ async function fetchUpstream(env) {
         started_at: alert.started_at
       });
     } else {
-      // city / hromada / unknown location_type: we don't have a reliable slug
-      // mapping for these, so we deliberately skip them rather than
-      // misattributing the alert to the whole oblast or a wrong district.
       console.error(`[alerts.in.ua] skipping unmapped location_type "${alert.location_type}" in ${alert.location_oblast}`);
     }
   }
@@ -419,18 +402,6 @@ function buildStatusSignature(data) {
   return buildStateSignature(data);
 }
 
-function statusChanged(previous, current) {
-  if (!previous) return true;
-  const prevSig = previous.signature || buildStatusSignature(previous.data);
-  const currSig = buildStatusSignature(current);
-  return prevSig !== currSig;
-}
-
-// alerts.in.ua limits requests per SECOND and blocks IPs/tokens that keep
-// breaking the limit (see devs.alerts.in.ua). Only the cron tick may hit the
-// API "fresh"; everything else (dashboard, /health, stale-snapshot self-heal)
-// goes through this per-isolate memo: results are reused for maxAgeMs, parallel
-// callers share one request, and after a 429 nobody calls until the cooldown ends.
 const upstreamMem = { data: null, at: 0, cooldownUntil: 0, lastError: null, inflight: null };
 
 async function fetchUpstreamShared(env, maxAgeMs = 30000) {
@@ -456,7 +427,6 @@ async function fetchUpstreamShared(env, maxAgeMs = 30000) {
   return upstreamMem.inflight;
 }
 
-// Cron only: one quick retry for transient failures (429 with a short Retry-After, 5xx, timeout).
 async function fetchUpstreamRetry(env) {
   try {
     return await fetchUpstream(env);
@@ -468,8 +438,6 @@ async function fetchUpstreamRetry(env) {
   }
 }
 
-// Cron health record in D1. Written only when the state changes (or at most every
-// 10 min while it keeps failing), so it costs almost no D1 writes.
 const CRON_STATUS_KEY = "cron-status";
 async function recordCron(env, ok, err) {
   try {
@@ -488,7 +456,7 @@ async function recordCron(env, ok, err) {
     } else if (now - (prev.lastAt || 0) > 600000) {
       await d1PutKV(env.DB, CRON_STATUS_KEY, JSON.stringify({ ...prev, lastAt: now, error: msg }));
     }
-  } catch (e) { /* diagnostics must never break the cron */ }
+  } catch (e) { }
 }
 
 async function getSharedSnapshot(env) {
@@ -517,16 +485,13 @@ async function getPublicAlerts(env, request, ctx = null) {
   }
 
   let stored = await readCache(env.DB);
-  // Self-heal: if the cron-written snapshot is stale (cron dead, D1 writes
-  // failing...), fetch live from upstream instead of serving stale data.
-  // Guarded so a burst of plugin requests doesn't hammer alerts.in.ua.
   if (stored && stored.fetchedAt && Date.now() - stored.fetchedAt > 2100000 && !(await hasEphemeralFlag("live-refresh"))) {
     await setEphemeralFlag("live-refresh", 20);
     try {
       const liveData = await fetchUpstreamShared(env);
       const liveAt = Date.now();
       const liveSig = buildStatusSignature(liveData);
-      await writeCache(env.DB, liveData, liveAt, liveSig); // swallows D1 errors
+      await writeCache(env.DB, liveData, liveAt, liveSig);
       stored = { fetchedAt: liveAt, signature: liveSig, data: liveData };
     } catch (e) {
       console.error("[api] live refresh failed:", e);
@@ -561,15 +526,6 @@ async function getPublicAlerts(env, request, ctx = null) {
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
   else await caches.default.put(cacheKey, response.clone());
   return { ...payload, serverTime: new Date().toISOString() };
-}
-
-
-function slug(v) {
-  return String(v || "").trim().toLowerCase().replace(/ё/g, "е").replace(/і/g, "i").replace(/ї/g, "i").replace(/є/g, "ie").replace(/ґ/g, "g").replace(/[^a-zа-яіїє0-9]+/gi, "-").replace(/^-+|-+$/g, "");
-}
-
-function normalizeText(v) {
-  return String(v || "").trim().toLowerCase().replace(/’/g, "'").replace(/\s+/g, " ");
 }
 
 function stateOf(item) {
@@ -612,14 +568,6 @@ function findAlert(data, oblastKey, districtKey) {
   for (const x of (data.raions || [])) {
     if (!x || typeof x !== "object") continue;
     const key = String(x.key || "");
-    // BUG: this used to also match on `key.split(":")[1] === district` alone,
-    // ignoring the oblast entirely. With today's static district list no two
-    // oblasts share a district slug, so it happened to be harmless — but it's
-    // wrong by construction: the day two districts anywhere in the list ever
-    // collide on slug (new raion added upstream, a renamed region, etc.) this
-    // would silently attribute one oblast's alert/district to a user
-    // subscribed to a different oblast with the same district slug. Only the
-    // full "oblast:district" key should count as a match here.
     if (key === wanted) return x;
   }
 
@@ -678,16 +626,10 @@ async function checkAllUsers(env) {
   const changed = previous.signature !== signature;
   const lastWriteAt = previous.fetchedAt || 0;
   const dueForRefresh = now - lastWriteAt >= MIN_CACHE_WRITE_INTERVAL_SECONDS * 1000;
-  // Transient Telegram failures (network, 5xx, rate limit) are retried on the
-  // next ticks, but only for RETRY_WINDOW_MS. `pendingRetry` holds the time the
-  // first failure happened (0 = nothing pending). Permanent failures (user
-  // blocked the bot, chat not found) are never retried.
   const retrySince = typeof previous.pendingRetry === "number" ? previous.pendingRetry : (previous.pendingRetry === true ? now : 0);
   const needsRetryPass = retrySince > 0 && now - retrySince < RETRY_WINDOW_MS;
   const retryBefore = needsRetryPass ? retrySince : 0;
 
-  // Publish the new snapshot BEFORE sending Telegram messages, so the plugin
-  // can see the change at the same moment the bot starts sending.
   if (changed || dueForRefresh) {
     await writeCache(env.DB, data, now, signature, retryBefore);
   }
@@ -695,7 +637,6 @@ async function checkAllUsers(env) {
   if (changed || needsRetryPass) {
     const hadFailures = await notifyUsers(env, previous.data, data, now);
     const retryAfter = hadFailures ? (retryBefore || now) : 0;
-    // Only touch D1 if the retry state actually changed (keeps writes minimal).
     if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
       await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
     }
@@ -713,16 +654,6 @@ async function deliverChange(env, job, now) {
   } else {
     text = stateMessage(user.region_name, newStatus, user.lang);
   }
-  // Best-effort dedupe: if KV writes are failing (quota), last_alert_state can't
-  // be saved and the same message would be re-sent every tick.
-  // BUG FIX: for the "clear" state, newStatus.since is always empty (an
-  // all-clear has no "since"), so the dedupe key used to be identical
-  // ("notified:<chat>:clear:") for every all-clear message from that chat.
-  // If two real alert cycles (red/yellow -> clear) ended within the 900s
-  // flag TTL, the second "all clear" notification was silently swallowed
-  // even though it was a genuinely new event. Use the alert's own start
-  // time (oldStatus.since, falling back to last_alert_start) so each
-  // occurrence gets its own dedupe key.
   const dedupeOccurrence = newStatus.state === "clear"
     ? (oldStatus.since || user.last_alert_start || "")
     : (newStatus.since || "");
@@ -731,15 +662,10 @@ async function deliverChange(env, job, now) {
   const res = alreadySent ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
   if (res.ok && !alreadySent) await setEphemeralFlag(dedupeName, 900);
   if (!res.ok && !res.permanent) {
-    // Transient failure: do NOT advance last_alert_state, so this user is
-    // retried on the next tick (within RETRY_WINDOW_MS).
     console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry`);
     return false;
   }
   if (!res.ok && res.permanent) {
-    // The user blocked the bot / chat doesn't exist. Retrying forever would
-    // burn KV quota for nothing, so treat it as handled. The record stays;
-    // a fresh /register (reconnect) overwrites it.
     console.error(`[notify] permanent failure for chat ${user.chat_id} (HTTP ${res.status}), not retrying`);
   }
   user.last_alert_state = newStatus.state;
@@ -750,7 +676,6 @@ async function deliverChange(env, job, now) {
   try {
     await writeUser(env, key, user);
   } catch (e) {
-    // Message already went out; don't report failure (would trigger a resend).
     console.error("[notify] could not save user state (KV write failed?):", e);
   }
   return true;
@@ -764,16 +689,8 @@ async function notifyUsers(env, previousData, data, now) {
     for (const item of page.keys || []) {
       const user = item.metadata || await readUser(env, item.name);
       if (!user || !user.chat_id || !user.oblast_key) continue;
-      // Notification "blacklist": everyone is in the DB, but users who
-      // turned notifications off in the plugin get no bot messages.
       if (user.notify === false) continue;
       const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-      // Gate on what THIS user was last actually (successfully) notified
-      // of, not on the global snapshot diff. deliverChange() only advances
-      // last_alert_state after a confirmed send, so a user whose message
-      // failed simply stays "behind" here and keeps getting retried every
-      // tick until it goes through, instead of being silently skipped
-      // forever once the global snapshot moves on.
       const knownState = user.last_alert_state || "clear";
       if (knownState === newStatus.state) continue;
       const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
@@ -850,20 +767,12 @@ const TEXTS = {
   }
 };
 
-// Bot language follows the plugin language. Anything unknown -> en (changed from
-// "uk" per request, to match telegram_client.py's telegram_lang() fallback).
 function normLang(v) {
   const l = String(v || "").toLowerCase().slice(0, 2);
   return l === "ru" || l === "en" || l === "uk" ? l : "en";
 }
 function M(lang) { return TEXTS[normLang(lang)]; }
 
-async function sendTelegramMessage(botToken, chatId, text) {
-  return (await sendTelegramDetailed(botToken, chatId, text)).ok;
-}
-
-// Returns { ok, permanent, status }. permanent = retrying can never help
-// (403 bot blocked, 400 chat not found, 404).
 async function sendTelegramDetailed(botToken, chatId, text) {
   if (!botToken) {
     console.error("[telegram] BOT_TOKEN not set");
@@ -878,7 +787,6 @@ async function sendTelegramDetailed(botToken, chatId, text) {
   try {
     let r = await doSend();
     if (r.status === 429) {
-      // Telegram rate limit (mass fan-out): wait what it asks (capped) and retry once.
       let retryAfter = 1;
       try {
         const body = await r.clone().json();
@@ -963,7 +871,7 @@ async function setEphemeralFlag(name, ttlSeconds) {
       new Request(`https://ephemeral-flags.internal/${encodeURIComponent(name)}`),
       new Response("1", { headers: { "Cache-Control": `max-age=${ttlSeconds}` } })
     );
-  } catch (e) { /* best effort */ }
+  } catch (e) { }
 }
 
 async function markUpdateProcessed(env, updateId) {
@@ -979,8 +887,6 @@ async function handleTelegramWebhook(request, env) {
   try {
     return await handleTelegramWebhookInner(request, env);
   } catch (e) {
-    // A duplicate-guard is already set for this update_id, so a 500 (and Telegram's
-    // retry) would be dropped anyway. Log it and answer 200.
     console.error("[webhook] handler error:", e);
     return json({ ok: true, error: "logged" });
   }
@@ -1030,20 +936,9 @@ async function handleTelegramWebhookInner(request, env) {
       JSON.stringify({ chat_id: String(chatId), lang, sync_token: syncToken, connected_at: new Date().toISOString() }),
       { expirationTtl: DEVICE_LINK_TTL_SECONDS }
     );
-    // NOTE: we deliberately do NOT send the "connected" message here anymore.
-    // This is only the device *link* being created (the user tapped the
-    // deep link) — the plugin still has to poll /telegram/get-chat-id and
-    // call /register successfully before the connection is real. Sending
-    // "подключено" at this point caused it to fire even when the plugin
-    // later failed to finish registration (bugs #1 and #2). The real
-    // confirmation is now sent from the /register handler, only once
-    // registration actually succeeds.
   } else if (command === "/start") {
     await sendTelegramTracked(env, chatId, M(message.from && message.from.language_code).genericStart);
   } else if (command === "/status") {
-    // NEW: on-demand status check without opening the plugin. Uses the same
-    // getSharedSnapshot()/alertStatus() the plugin and the notifier use, so
-    // it's always consistent with what the bot would otherwise push.
     const user = await readUser(env, `user:${chatId}`);
     const lang = normLang(message.from && message.from.language_code || (user && user.lang));
     const m = M(lang);
@@ -1081,20 +976,15 @@ async function handleSetupWebhook(request, env) {
   return json({ ok: r.ok, webhook_url: target.toString(), telegram_response: body });
 }
 
-// ───────────────────────── ADMIN DASHBOARD (owner only) ─────────────────────────
-// Password = secret ADMIN_TOKEN. Open https://<worker>/admin and log in.
-// Without ADMIN_TOKEN the dashboard is disabled.
 function safeEqual(a, b) {
   a = String(a || ""); b = String(b || "");
   let d = a.length ^ b.length;
   for (let i = 0; i < Math.max(a.length, b.length); i++) d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   return d === 0;
 }
-// Session cookie = "<expiryMs>.<hmac>" signed with ADMIN_TOKEN. The password itself
-// is never stored in the browser; changing ADMIN_TOKEN logs every session out.
 const ADMIN_SESSION_SEC = 7 * 24 * 3600;
-const ADMIN_MAX_FAILS = 5;         // failed logins per IP ...
-const ADMIN_FAIL_WINDOW_SEC = 600; // ... per 10 minutes (best effort, Cache API)
+const ADMIN_MAX_FAILS = 5;
+const ADMIN_FAIL_WINDOW_SEC = 600;
 
 async function hmacHex(secret, msg) {
   const enc = new TextEncoder();
@@ -1109,7 +999,7 @@ async function makeSession(env, ttlSec) {
 async function isAdmin(request, env) {
   if (!env.ADMIN_TOKEN) return false;
   const h = request.headers.get("Authorization") || "";
-  if (h.startsWith("Bearer ") && safeEqual(h.slice(7), env.ADMIN_TOKEN)) return true; // curl / scripts
+  if (h.startsWith("Bearer ") && safeEqual(h.slice(7), env.ADMIN_TOKEN)) return true;
   const m = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)adm=([^;]+)/);
   if (!m) return false;
   const dot = m[1].indexOf(".");
@@ -1118,7 +1008,7 @@ async function isAdmin(request, env) {
   if (!Number.isFinite(exp) || exp < Date.now()) return false;
   return safeEqual(m[1].slice(dot + 1), await hmacHex(env.ADMIN_TOKEN, "adm:" + exp));
 }
-const failMem = new Map(); // ip -> { n, until }
+const failMem = new Map();
 async function failCount(ip) {
   const m = failMem.get(ip);
   if (m && m.until > Date.now()) return m.n;
@@ -1134,7 +1024,7 @@ async function bumpFail(ip, n) {
   try {
     await caches.default.put(new Request(`https://admin-fail.internal/${encodeURIComponent(ip)}`),
       new Response(String(n), { headers: { "Cache-Control": `max-age=${ADMIN_FAIL_WINDOW_SEC}` } }));
-  } catch (e) { /* best effort */ }
+  } catch (e) { }
 }
 function loginPage(msg, status = 200) {
   const html = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
@@ -1172,11 +1062,10 @@ async function handleLogin(request, env) {
   try {
     if ((request.headers.get("Content-Type") || "").includes("application/json")) pw = (await request.json()).password;
     else pw = (await request.formData()).get("password");
-  } catch (e) { /* empty password */ }
-  // Pasting from the clipboard often adds a trailing space/newline.
+  } catch (e) { }
   if (!safeEqual(String(pw || "").trim(), String(env.ADMIN_TOKEN).trim())) {
     await bumpFail(ip, fails + 1);
-    await new Promise(r => setTimeout(r, 800)); // slow down guessing
+    await new Promise(r => setTimeout(r, 800));
     return loginPage("Неверный пароль", 401);
   }
   const value = await makeSession(env, ADMIN_SESSION_SEC);
@@ -1251,7 +1140,6 @@ async function adminData(env, request, full, kvTest, probeUp) {
   return out;
 }
 
-
 function versionCompare(a, b) {
   const pa = String(a || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
   const pb = String(b || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
@@ -1264,170 +1152,11 @@ async function getPluginVersion(env) {
   try {
     const setting = await env.DB.prepare("SELECT update_check_enabled FROM plugin_version_settings WHERE id=1").first();
     update_check_enabled = !!(setting && Number(setting.update_check_enabled) === 1);
-  } catch (_) { /* Fail closed: never announce updates if the setting is unavailable. */ }
+  } catch (_) { }
   return { ...(row || { latest_version: "1.0.0", minimum_version: "1.0.0", changelog: "", update_url: "https://t.me/excess_plugins/100", updated_at: null }), update_check_enabled };
 }
-async function getBroadcastAudience(env, filter) {
-  const users = [];
-  let cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 500, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const u = item.metadata || await readUser(env, item.name);
-      if (!u || !u.chat_id) continue;
-      if (filter.type === "oblast" && u.oblast_key !== filter.oblast_key) continue;
-      if (filter.type === "district" && (u.oblast_key !== filter.oblast_key || u.district_key !== filter.district_key)) continue;
-      if (filter.type === "version") {
-        const v = String(u.plugin_version || "");
-        const prefix = String(filter.version_prefix || "").trim();
-        if (!prefix || !v.startsWith(prefix)) continue;
-      }
-      if (filter.type === "telegram" && u.telegram_connected === false) continue;
-      users.push({ chat_id: String(u.chat_id), user: u });
-    }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
-  return users;
-}
-function guessBroadcastSourceLanguage(text, requested) {
-  const lang = String(requested || "").toLowerCase();
-  if (["ru", "uk", "en"].includes(lang)) return lang;
-  const s = String(text || "");
-  if (/[іїєґІЇЄҐ]/.test(s)) return "uk";
-  if (/[а-яёА-ЯЁ]/.test(s)) return "ru";
-  return "en";
-}
 
-async function translateBroadcastVariants(env, text, requestedSource) {
-  const source = guessBroadcastSourceLanguage(text, requestedSource);
-  if (!env.AI || typeof env.AI.run !== "function") throw new Error("Workers AI не подключён. Добавь AI binding в wrangler.toml и включи Workers AI в Cloudflare, затем повтори предпросмотр.");
-  const translations = { ru: "", uk: "", en: "" };
-  translations[source] = text;
-  for (const target of ["ru", "uk", "en"].filter(x => x !== source)) {
-    const aiLanguage = { ru: "russian", uk: "ukrainian", en: "english" };
-    const result = await env.AI.run("@cf/meta/m2m100-1.2b", { text, source_lang: aiLanguage[source], target_lang: aiLanguage[target] });
-    const translated = String(result && (result.translated_text || result.translation || result.response) || "").trim();
-    if (!translated) throw new Error(`Перевод на ${target} не получен. Исходный текст не отправлен.`);
-    translations[target] = translated;
-  }
-  return { source_language: source, translations };
-}
 
-async function createBroadcast(env, body) {
-  const text = String(body.text || "").trim();
-  if (!text || text.length > 4096) return { error: "message must be 1-4096 characters", status: 400 };
-  const filter = body.audience && typeof body.audience === "object" ? body.audience : { type: "all" };
-  const allowed = ["all","telegram","oblast","district","version"];
-  if (!allowed.includes(filter.type || "all")) return { error: "invalid audience type", status: 400 };
-  const normalized = { ...filter, type: filter.type || "all" };
-  const recipients = await getBroadcastAudience(env, normalized);
-  let sourceLanguage = guessBroadcastSourceLanguage(text, body.source_language);
-  let translations = body.translations && typeof body.translations === "object" ? { ...body.translations } : null;
-  if (!translations && body.translate === false) translations = { ru: text, uk: text, en: text };
-  if (!translations) {
-    try { const result = await translateBroadcastVariants(env, text, body.source_language); sourceLanguage = result.source_language; translations = result.translations; }
-    catch (e) { return { error: String(e && e.message || e), status: 503 }; }
-  }
-  for (const lang of ["ru", "uk", "en"]) {
-    translations[lang] = String(translations[lang] || "").trim();
-    if (!translations[lang] || translations[lang].length > 4096) return { error: `missing or too long ${lang} translation`, status: 400 };
-  }
-  if (body.preview === true || body.confirm !== true) return { ok: true, preview: true, count: recipients.length, audience: normalized, source_language: sourceLanguage, translations };
-  const now = new Date().toISOString();
-  const ins = await env.DB.prepare("INSERT INTO broadcast_jobs (text,translations_json,audience_json,status,total_count,created_at,created_by) VALUES (?1,?2,?3,'queued',?4,?5,?6)")
-    .bind(text, JSON.stringify(translations), JSON.stringify(normalized), recipients.length, now, "admin").run();
-  const jobId = Number(ins.meta && ins.meta.last_row_id);
-  for (let i=0;i<recipients.length;i+=50) {
-    const batch = recipients.slice(i,i+50);
-    const stmts = batch.map(x => env.DB.prepare("INSERT OR IGNORE INTO broadcast_recipients (job_id,chat_id,status,created_at) VALUES (?1,?2,'queued',?3)").bind(jobId,x.chat_id,now));
-    if (stmts.length) await env.DB.batch(stmts);
-  }
-  return { ok: true, job_id: jobId, count: recipients.length, status: "queued" };
-}
-async function processBroadcastBatch(env, limit = 20) {
-  if (!env.DB || !env.BOT_TOKEN) return;
-  const jobs = await env.DB.prepare("SELECT id,text,translations_json FROM broadcast_jobs WHERE status IN ('queued','sending') ORDER BY id LIMIT 5").all();
-  let remaining = Math.max(1,Math.min(50,limit));
-  for (const job of jobs.results || []) {
-    if (remaining <= 0) break;
-    let translations = {};
-    try { translations = JSON.parse(job.translations_json || "{}"); } catch (_) {}
-    const recipients = await env.DB.prepare("SELECT id,chat_id FROM broadcast_recipients WHERE job_id=?1 AND status='queued' ORDER BY id LIMIT ?2").bind(job.id, remaining).all();
-    remaining -= (recipients.results || []).length;
-    for (let i=0;i<(recipients.results||[]).length;i+=10) {
-      await Promise.all(recipients.results.slice(i,i+10).map(async rec => {
-        try {
-          const recipientUser = await readUser(env, `user:${rec.chat_id}`);
-          const rawRecipientLanguage = String(recipientUser && recipientUser.lang || "").toLowerCase().slice(0, 2);
-          // Unknown language -> en (changed from "ru" for consistency with normLang()/telegram_lang()).
-          const recipientLanguage = ["ru", "uk", "en"].includes(rawRecipientLanguage) ? rawRecipientLanguage : "en";
-          const recipientText = String(translations[recipientLanguage] || translations.ru || job.text);
-          const r = await fetchWithTimeout(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id:rec.chat_id,text:recipientText}) }, FETCH_TIMEOUT_MS);
-          const j = await r.json().catch(()=>({}));
-          await env.DB.prepare("UPDATE broadcast_recipients SET status=?1,error=?2,sent_at=?3 WHERE id=?4").bind(r.ok&&j.ok?"sent":"failed",r.ok&&j.ok?null:String(j.description||`HTTP ${r.status}`).slice(0,300),r.ok&&j.ok?new Date().toISOString():null,rec.id).run();
-        } catch(e) {
-          await env.DB.prepare("UPDATE broadcast_recipients SET status='failed',error=?1 WHERE id=?2").bind(String(e).slice(0,300),rec.id).run();
-        }
-      }));
-    }
-    const stat = await env.DB.prepare("SELECT COUNT(*) total, SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) queued, SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) sent, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed FROM broadcast_recipients WHERE job_id=?1").bind(job.id).first();
-    await env.DB.prepare("UPDATE broadcast_jobs SET status=?1,sent_count=?2,failed_count=?3,updated_at=?4 WHERE id=?5").bind(stat.queued ? "sending" : "completed",stat.sent||0,stat.failed||0,new Date().toISOString(),job.id).run();
-  }
-}
-async function startSimulation(env, body) {
-  const oblast = String(body.oblast_key || "");
-  const district = String(body.district_key || "");
-  const state = String(body.state || "");
-  const duration = body.duration_seconds === null || body.duration_seconds === "manual" ? null : Number(body.duration_seconds);
-  if (!Object.prototype.hasOwnProperty.call(OBLAST_NAMES_UK, oblast)) return { error:"invalid oblast_key", status:400 };
-  if (district && !Object.prototype.hasOwnProperty.call(DISTRICT_NAMES_UK, `${oblast}:${district}`)) return { error:"invalid district_key", status:400 };
-  if (!["red","yellow","green"].includes(state)) return { error:"state must be red, yellow or green", status:400 };
-  if (duration !== null && ![30,60,300].includes(duration)) return { error:"duration must be 30, 60, 300 seconds or manual", status:400 };
-  const now = Date.now(), expires = duration === null ? null : now + duration*1000;
-  const scopeKey = `${oblast}:${district}`;
-  await env.DB.prepare("UPDATE simulations SET active=0,ended_at=?1 WHERE scope_key=?2 AND active=1").bind(new Date(now).toISOString(),scopeKey).run();
-  const ins = await env.DB.prepare("INSERT INTO simulations (scope_key,oblast_key,district_key,state,started_at,expires_at,active,created_by) VALUES (?1,?2,?3,?4,?5,?6,1,'admin')")
-    .bind(scopeKey,oblast,district||null,state,new Date(now).toISOString(),expires?new Date(expires).toISOString():null).run();
-  const area = district ? `${OBLAST_NAMES_UK[oblast]} · ${DISTRICT_NAMES_UK[`${oblast}:${district}`]}` : OBLAST_NAMES_UK[oblast];
-  const stateText = state === "red" ? "🔴 Симулирована тревога" : state === "yellow" ? "🟡 Симулирован жёлтый уровень" : "🟢 Симулирован отбой";
-  try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ — не является реальным оповещением alerts.in.ua
-${stateText}
-${area}`,audience:{type:district?"district":"oblast",oblast_key:oblast,district_key:district},translate:false,confirm:true}); }
-  catch(e) { console.error("[simulation] Telegram test notification queue failed:",e); }
-  return { ok:true, id:Number(ins.meta&&ins.meta.last_row_id)||null, scope_key:scopeKey, state, started_at:new Date(now).toISOString(), expires_at:expires?new Date(expires).toISOString():null };
-}
-async function expireSimulations(env) {
-  const now = new Date().toISOString();
-  const expired = await env.DB.prepare("SELECT * FROM simulations WHERE active=1 AND expires_at IS NOT NULL AND expires_at<=?1").bind(now).all();
-  for (const sim of expired.results || []) {
-    const changed = await env.DB.prepare("UPDATE simulations SET active=0,ended_at=?1 WHERE id=?2 AND active=1").bind(now,sim.id).run();
-    if (changed.meta && changed.meta.changes && sim.state !== "green") {
-      const area = sim.district_key ? `${OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key} · ${DISTRICT_NAMES_UK[`${sim.oblast_key}:${sim.district_key}`]||sim.district_key}` : (OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key);
-      try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ ЗАВЕРШЕНА
-🟢 Симулирован отбой
-${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},translate:false,confirm:true}); }
-      catch(e) { console.error("[simulation] expiry notification queue failed:",e); }
-    }
-  }
-}
-async function getSimulation(env, oblast, district) {
-  await expireSimulations(env);
-  const scopes = [`${oblast}:${district||""}`, `${oblast}:`];
-  const r = await env.DB.prepare("SELECT * FROM simulations WHERE active=1 AND scope_key IN (?1,?2) ORDER BY id DESC LIMIT 1").bind(...scopes).first();
-  return r || null;
-}
-async function stopSimulation(env, id) {
-  const sim = await env.DB.prepare("SELECT * FROM simulations WHERE id=?1 AND active=1").bind(Number(id)).first();
-  const r = await env.DB.prepare("UPDATE simulations SET active=0,ended_at=?1 WHERE id=?2 AND active=1").bind(new Date().toISOString(),Number(id)).run();
-  if (sim && r.meta && r.meta.changes && sim.state !== "green") {
-    const area = sim.district_key ? `${OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key} · ${DISTRICT_NAMES_UK[`${sim.oblast_key}:${sim.district_key}`]||sim.district_key}` : (OBLAST_NAMES_UK[sim.oblast_key]||sim.oblast_key);
-    try { await createBroadcast(env,{text:`🧪 ТЕСТОВАЯ СИМУЛЯЦИЯ ЗАВЕРШЕНА
-🟢 Симулирован отбой
-${area}`,audience:{type:sim.district_key?"district":"oblast",oblast_key:sim.oblast_key,district_key:sim.district_key||""},translate:false,confirm:true}); }
-    catch(e) { console.error("[simulation] stop notification queue failed:",e); }
-  }
-  return { ok: true, changes: r.meta && r.meta.changes || 0 };
-}
 async function handleAdmin(request, env, url) {
   const p = url.pathname;
   if (!env.ADMIN_TOKEN) return new Response("Admin disabled: set the ADMIN_TOKEN secret", { status: 404 });
@@ -1449,9 +1178,7 @@ async function handleAdmin(request, env, url) {
   if (userMatch && request.method === "GET") {
     const id = userMatch[1];
     const user = await readUser(env, `user:${id}`);
-    let latestError = null;
-    try { latestError = await env.DB.prepare("SELECT error,created_at FROM broadcast_recipients WHERE chat_id=?1 AND error IS NOT NULL ORDER BY id DESC LIMIT 1").bind(id).first(); } catch (_) {}
-    return adminJson({ok:true,telegram_id:id,profile:user||null,last_error:latestError,telegram_connected:!!(user && user.telegram_connected !== false)});
+    return adminJson({ok:true,telegram_id:id,profile:user||null,telegram_connected:!!(user && user.telegram_connected !== false)});
   }
   if (p === "/admin/version" && request.method === "GET") {
     try { return adminJson({ok:true, ...(await getPluginVersion(env))}); } catch(e) { return adminJson({error:String(e)},500); }
@@ -1467,28 +1194,6 @@ async function handleAdmin(request, env, url) {
       await env.DB.prepare("INSERT INTO plugin_version_settings (id,update_check_enabled,updated_at) VALUES (1,?1,?2) ON CONFLICT(id) DO UPDATE SET update_check_enabled=excluded.update_check_enabled,updated_at=excluded.updated_at").bind(updateCheckEnabled ? 1 : 0,new Date().toISOString()).run();
       return adminJson({ok:true,latest_version:latest,minimum_version:minimum,changelog,update_url:parsedUpdateUrl.toString(),update_check_enabled:updateCheckEnabled});
     } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/broadcast/preview" && request.method === "POST") {
-    try { const out = await createBroadcast(env,{...(await request.json()),preview:true}); return adminJson(out,out.status||200); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/broadcast/create" && request.method === "POST") {
-    try { const out=await createBroadcast(env,await request.json()); return adminJson(out,out.status||200); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/broadcast/jobs" && request.method === "GET") {
-    try { const r=await env.DB.prepare("SELECT * FROM broadcast_jobs ORDER BY id DESC LIMIT 50").all(); return adminJson({ok:true,jobs:r.results||[]}); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/broadcast/process" && request.method === "POST") {
-    try { await processBroadcastBatch(env,20); return adminJson({ok:true}); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/simulations" && request.method === "POST") {
-    try { const out=await startSimulation(env,await request.json()); return adminJson(out,out.status||200); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/simulations" && request.method === "GET") {
-    try { const r=await env.DB.prepare("SELECT * FROM simulations ORDER BY id DESC LIMIT 100").all(); return adminJson({ok:true,simulations:r.results||[]}); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  const stopSimMatch = p.match(/^\/admin\/simulations\/(\d+)\/stop$/);
-  if (stopSimMatch && request.method === "POST") {
-    try { return adminJson(await stopSimulation(env,stopSimMatch[1])); } catch(e) { return adminJson({error:String(e)},500); }
   }
   if (p === "/admin") return new Response(ADMIN_HTML, { headers: {
     "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
@@ -1728,9 +1433,6 @@ export default {
       return json({ ok: true, service: "Air Raid Alert — Universal Worker" });
     }
 
-    // These two used to be public. Once ADMIN_TOKEN is configured they require it
-    // (cookie from /admin?token=... or "Authorization: Bearer ..."). Before that
-    // they keep working so the first webhook setup is still possible.
     const adminGate = (url.pathname === "/setup-webhook" || url.pathname === "/webhook-info") &&
       env.ADMIN_TOKEN && !(await isAdmin(request, env));
     if (adminGate) return new Response("Unauthorized. Open /admin?token=... first", { status: 401 });
@@ -1750,8 +1452,6 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      // Public part is passive (no upstream call, no D1 write): anyone could otherwise
-      // burn the alerts.in.ua rate limit and rack up needless D1 writes by reloading it.
       const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN };
       try {
         const c = await readCache(env.DB);
@@ -1779,15 +1479,7 @@ export default {
         return json({ok:true,update_check_enabled:v.update_check_enabled,latest_version:v.latest_version,minimum_version:v.minimum_version,update_url:v.update_url||"https://t.me/excess_plugins/100",changelog:v.changelog||"",updated_at:v.updated_at||null,installed_version:installed,update_available:v.update_check_enabled && versionCompare(installed,v.latest_version)<0,update_required:v.update_check_enabled && versionCompare(installed,v.minimum_version)<0});
       } catch(e) { return json({error:"version service unavailable",detail:String(e)},500); }
     }
-    if (url.pathname === "/plugin/simulation" && method === "GET") {
-      try {
-        const oblast=url.searchParams.get("oblast_key")||"", district=url.searchParams.get("district_key")||"";
-        if (!Object.prototype.hasOwnProperty.call(OBLAST_NAMES_UK,oblast)) return json({ok:false,error:"invalid oblast_key"},400);
-        const sim=await getSimulation(env,oblast,district);
-        return json({ok:true,simulation:sim?{id:sim.id,state:sim.state,scope_key:sim.scope_key,started_at:sim.started_at,expires_at:sim.expires_at}:null,simulated:!!sim});
-      } catch(e) { return json({error:"simulation service unavailable",detail:String(e)},500); }
-    }
-    if (url.pathname === "/api") {
+        if (url.pathname === "/api") {
       try {
         return json(await getPublicAlerts(env, request, ctx));
       } catch (e) {
@@ -1814,14 +1506,8 @@ export default {
 
         const key = `user:${chat_id}`;
         const existing = await readUser(env, key);
-        // Bot language follows the plugin language. Old plugins send no/"uk" lang.
         const lang = body.lang ? normLang(body.lang) : normLang(existing && existing.lang);
 
-        // A device link is proof the person just pressed Start for THIS
-        // Telegram chat via a fresh deep link — that's real ownership proof
-        // on its own, independent of whatever sync_token the client may or
-        // may not already have. We resolve it up front so it can be used to
-        // recover a desynced connection below, not only for brand-new users.
         let deviceLink = null;
         if (body.device_id) {
           const candidate = await env.USERS.get(`device:${body.device_id}`, "json");
@@ -1830,14 +1516,6 @@ export default {
           }
         }
 
-        // Only enforce the existing sync_token when there is no fresh,
-        // valid device link to fall back on. Without this, a client that
-        // ever loses track of its sync_token (a timed-out /register whose
-        // response never arrived, a reinstall, cleared app data, or the
-        // rollback in telegram_connect() after a failed registration) would
-        // be permanently locked out: every future attempt reuses a NEW
-        // device link/token that can never match the OLD one already
-        // stored server-side. A valid device link lets it re-link instead.
         if (existing && existing.sync_token && !validSyncToken(existing, sync_token) && !deviceLink) {
           return json({ error: "invalid sync token" }, 403);
         }
@@ -1852,20 +1530,14 @@ export default {
           ? ((typeof sync_token === "string" && sync_token) || await randomToken())
           : ((existing && existing.sync_token) || (typeof sync_token === "string" && sync_token) || await randomToken());
 
-        // Location identity = keys only. A changed display name (e.g. the user
-        // switched the plugin language) or a changed language is saved silently;
-        // it must NOT re-send the "subscribed" + status messages.
         const sameLocation = !!existing &&
           String(existing.oblast_key || "") === String(oblast_key || "") &&
           String(existing.district_key || "") === String(district_key || "");
 
-        // Notification flag. Users always stay in the DB; notify=false just
-        // excludes them from bot messages. Missing flag = on (old records,
-        // old plugin versions that don't send it).
         const prevNotify = existing ? existing.notify !== false : true;
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
-        const relinked = !!deviceLink; // fresh "Start" in Telegram = (re)connection
+        const relinked = !!deviceLink;
         const resync = !existing || !sameLocation || (notifyChanged && notify) || relinked;
         const changed = !existing || !sameLocation || notifyChanged || relinked;
 
@@ -1901,31 +1573,16 @@ export default {
           normLang(existing.lang) === userData.lang &&
           (existing.notify !== false) === notify &&
           existing.sync_token === token;
-        // Every register call used to cost a KV write even when nothing changed
-        // (resume, resync...). KV free tier is 1000 writes/day, so skip it.
         if (!nothingChanged) await writeUser(env, key, userData);
         const isNewDeviceLink = !!deviceLink;
         if (deviceLink) await env.USERS.delete(`device:${body.device_id}`);
 
-        // Send Telegram notifications in the background (ctx.waitUntil) so the
-        // HTTP response to the plugin doesn't have to wait on one or more
-        // sequential Telegram API round-trips — this was adding real latency
-        // to every /register call (bug #4). Order is preserved by awaiting
-        // them one after another inside this async function; only the HTTP
-        // response is decoupled from it.
         const sendNotifications = async () => {
-          // This is the real "connected" confirmation — sent whenever a
-          // fresh device link was actually consumed, whether this is a
-          // brand-new registration or a recovery re-link for an existing
-          // user (e.g. after a lost sync_token). Never sent just because
-          // the user tapped the Telegram link (fixes bugs #1 and #2).
           const m = M(lang);
           if (isNewDeviceLink) {
             await sendTelegramTracked(env, chat_id, m.connected);
           }
           if (notify) {
-            // Also on a re-link: an already-known user who reconnects (same
-            // location) used to get only "connected" and no current status.
             if (hasLocation && (!existing || !sameLocation || notifyChanged || relinked)) {
               await sendTelegramTracked(env, chat_id, m.subscribed(region_name));
               await sendTelegramTracked(env, chat_id, stateMessage(region_name, status, lang));
@@ -2002,11 +1659,6 @@ export default {
 
         if (!env.BOT_TOKEN) return json({ error: "BOT_TOKEN not configured on worker" }, 500);
         const sendResult = await sendTelegramTracked(env, chat_id, M(existing.lang).test);
-        // BUG FIX: sendTelegramTracked() returns a result OBJECT ({ok, permanent,
-        // status, ...}), not a boolean. `if (!sendResult)` was always false (an
-        // object is truthy even as {ok:false}), so this endpoint reported success
-        // to the plugin's "Отправить тест" button even when Telegram delivery
-        // genuinely failed (bot blocked, bad token, Telegram API error, etc).
         if (!sendResult.ok) return json({ error: sendResult.description || "telegram sendMessage failed, check worker logs" }, 502);
         return json({ ok: true });
       } catch (e) {
@@ -2019,7 +1671,5 @@ export default {
 
   async scheduled(event, env, ctx) {
     await checkAllUsers(env);
-    try { await expireSimulations(env); } catch (e) { console.error("[simulation] scheduled expiry failed:", e); }
-    try { await processBroadcastBatch(env, 20); } catch (e) { console.error("[broadcast] scheduled batch failed:", e); }
-  }
+          }
 };
