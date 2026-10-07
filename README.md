@@ -32,19 +32,6 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
      value TEXT,
      updated_at INTEGER
    );
-   CREATE TABLE plugin_versions (
-     id INTEGER PRIMARY KEY,
-     latest_version TEXT,
-     minimum_version TEXT,
-     changelog TEXT,
-     update_url TEXT,
-     updated_at TEXT
-   );
-   CREATE TABLE plugin_version_settings (
-     id INTEGER PRIMARY KEY,
-     update_check_enabled INTEGER,
-     updated_at TEXT
-   );
    ```
 3. **Create the Worker.** Workers & Pages → *Create* → *Worker* → give it a name → *Edit code*, replace the default code with the contents of `worker.js`, then *Deploy*.
 4. **Add bindings.** Open the Worker → *Settings* → *Bindings* → *Add*:
@@ -63,7 +50,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 | Binding | Type | Purpose |
 |---|---|---|
 | `USERS` | KV | User records, device-link tokens |
-| `DB` | D1 | Alert snapshot cache, cron status, plugin version policy |
+| `DB` | D1 | Alert snapshot cache, cron status |
 
 ### Endpoints
 | Method | Path | Description |
@@ -75,17 +62,12 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 | POST | `/unregister` | Remove a user |
 | POST | `/telegram/webhook` | Telegram updates (`message`, `callback_query`) |
 | POST | `/telegram/test` | Send a test message to a user |
-| GET | `/plugin/version` | Plugin update policy |
 | GET | `/webhook-info` | Telegram webhook status |
 | GET | `/admin` | Owner dashboard (requires `ADMIN_TOKEN`) |
 
 ### Security notes
 - The dashboard uses a password login with a signed session cookie (HMAC-SHA256, 7 days). Scripts can use `Authorization: Bearer <ADMIN_TOKEN>`.
 - Failed logins are rate-limited per IP.
-- Plugin sync tokens are checked on `/unregister` and `/telegram/test`.
-
-### License
-Add your license here.
 
 ---
 
@@ -115,19 +97,6 @@ Add your license here.
      value TEXT,
      updated_at INTEGER
    );
-   CREATE TABLE plugin_versions (
-     id INTEGER PRIMARY KEY,
-     latest_version TEXT,
-     minimum_version TEXT,
-     changelog TEXT,
-     update_url TEXT,
-     updated_at TEXT
-   );
-   CREATE TABLE plugin_version_settings (
-     id INTEGER PRIMARY KEY,
-     update_check_enabled INTEGER,
-     updated_at TEXT
-   );
    ```
 3. **Создайте Worker.** Workers & Pages → *Create* → *Worker* → укажите имя → *Edit code*, замените код по умолчанию содержимым `worker.js`, затем *Deploy*.
 4. **Добавьте биндинги.** Откройте Worker → *Settings* → *Bindings* → *Add*:
@@ -146,7 +115,7 @@ Add your license here.
 | Биндинг | Тип | Назначение |
 |---|---|---|
 | `USERS` | KV | Записи пользователей, токены привязки устройств |
-| `DB` | D1 | Кэш снимка тревог, статус cron, политика версий плагина |
+| `DB` | D1 | Кэш снимка тревог, статус cron |
 
 ### Эндпоинты
 | Метод | Путь | Описание |
@@ -158,17 +127,12 @@ Add your license here.
 | POST | `/unregister` | Удаление пользователя |
 | POST | `/telegram/webhook` | Обновления Telegram (`message`, `callback_query`) |
 | POST | `/telegram/test` | Отправка тестового сообщения пользователю |
-| GET | `/plugin/version` | Политика обновления плагина |
 | GET | `/webhook-info` | Статус вебхука Telegram |
 | GET | `/admin` | Панель владельца (нужен `ADMIN_TOKEN`) |
 
 ### Безопасность
 - Панель использует вход по паролю и подписанную cookie-сессию (HMAC-SHA256, 7 дней). Скрипты могут использовать `Authorization: Bearer <ADMIN_TOKEN>`.
 - Неудачные входы ограничены по IP.
-- Токены синхронизации плагина проверяются в `/unregister` и `/telegram/test`.
-
-### Лицензия
-Укажите вашу лицензию здесь.
 
 ---
 
@@ -198,19 +162,6 @@ Add your license here.
      value TEXT,
      updated_at INTEGER
    );
-   CREATE TABLE plugin_versions (
-     id INTEGER PRIMARY KEY,
-     latest_version TEXT,
-     minimum_version TEXT,
-     changelog TEXT,
-     update_url TEXT,
-     updated_at TEXT
-   );
-   CREATE TABLE plugin_version_settings (
-     id INTEGER PRIMARY KEY,
-     update_check_enabled INTEGER,
-     updated_at TEXT
-   );
    ```
 3. **Створіть Worker.** Workers & Pages → *Create* → *Worker* → вкажіть назву → *Edit code*, замініть код за замовчуванням вмістом `worker.js`, потім *Deploy*.
 4. **Додайте біндинги.** Відкрийте Worker → *Settings* → *Bindings* → *Add*:
@@ -229,7 +180,7 @@ Add your license here.
 | Біндинг | Тип | Призначення |
 |---|---|---|
 | `USERS` | KV | Записи користувачів, токени прив'язки пристроїв |
-| `DB` | D1 | Кеш снімка тривог, статус cron, політика версій плагіна |
+| `DB` | D1 | Кеш снімка тривог, статус cron |
 
 ### Ендпоінти
 | Метод | Шлях | Опис |
@@ -241,14 +192,32 @@ Add your license here.
 | POST | `/unregister` | Видалення користувача |
 | POST | `/telegram/webhook` | Оновлення Telegram (`message`, `callback_query`) |
 | POST | `/telegram/test` | Надсилання тестового повідомлення користувачу |
-| GET | `/plugin/version` | Політика оновлення плагіна |
 | GET | `/webhook-info` | Статус вебхука Telegram |
 | GET | `/admin` | Панель власника (потрібен `ADMIN_TOKEN`) |
 
 ### Безпека
 - Панель використовує вхід за паролем і підписану cookie-сесію (HMAC-SHA256, 7 днів). Скрипти можуть використовувати `Authorization: Bearer <ADMIN_TOKEN>`.
 - Невдалі входи обмежені за IP.
-- Токени синхронізації плагіна перевіряються в `/unregister` і `/telegram/test`.
 
-### Ліцензія
-Вкажіть вашу ліцензію тут.
+### License
+MIT License
+
+Copyright © 2026 Bogdan Delas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
