@@ -4,11 +4,11 @@ compatibility_date = "2024-01-01"
 keep_vars = true
 
 kv_namespaces = [
-  { binding = "USERS", id = "<KV_NAMESPACE_ID>" }
+  { binding = "USERS", id = "23d60800f794435b8596c28c62de177c" }
 ]
 
 d1_databases = [
-  { binding = "DB", database_name = "air-raid-cache", database_id = "<D1_DATABASE_ID>" }
+  { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
 [triggers]
