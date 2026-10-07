@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright © 2026 Bogdan Delas
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 
 const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
@@ -722,11 +746,12 @@ function formatDuration(ms, lang) {
 const TEXTS = {
   uk: {
     connected: "🟢 Telegram-бот підключено",
+    linking: "⏳ Зачекай трохи, підключаємо сповіщення…",
     genericStart: "Щоб підключити сповіщення, натисни кнопку в налаштуваннях плагіна Air Raid Alert.",
     subscribed: region => `✅ Підписка активна: <b>${region}</b>`,
     clear: region => `🟢 <b>Тривоги немає</b>\n${region}`,
     yellow: (region, time) => `🟡 <b>Жовтий рівень загрози</b>\n${region} • ${time}`,
-    red: (region, time) => `🔴 <b>Повітряна тривога</b>\n${region} • ${time}`,
+    red: (region, time) => `🔴 <b>Червоний рівень загрози</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>Тривоги немає</b>\n${region} • ${start}–${end} • ${duration}`,
     enabled: "✅ Сповіщення через Telegram увімкнено",
     unsubscribed: "❌ Сповіщення через Telegram вимкнено",
@@ -737,11 +762,12 @@ const TEXTS = {
   },
   ru: {
     connected: "🟢 Telegram-бот подключён",
+    linking: "⏳ Подожди немного, подключаем уведомления…",
     genericStart: "Чтобы подключить уведомления, нажмите кнопку в настройках плагина Air Raid Alert.",
     subscribed: region => `✅ Подписка активна: <b>${region}</b>`,
     clear: region => `🟢 <b>Тревоги нет</b>\n${region}`,
     yellow: (region, time) => `🟡 <b>Жёлтый уровень угрозы</b>\n${region} • ${time}`,
-    red: (region, time) => `🔴 <b>Воздушная тревога</b>\n${region} • ${time}`,
+    red: (region, time) => `🔴 <b>Красный уровень угрозы</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>Тревоги нет</b>\n${region} • ${start}–${end} • ${duration}`,
     enabled: "✅ Уведомления через Telegram включены",
     unsubscribed: "❌ Уведомления через Telegram отключены",
@@ -752,11 +778,12 @@ const TEXTS = {
   },
   en: {
     connected: "🟢 Telegram bot connected",
+    linking: "⏳ Please wait a moment, connecting notifications…",
     genericStart: "To connect notifications, tap the button in the Air Raid Alert plugin settings.",
     subscribed: region => `✅ Subscription active: <b>${region}</b>`,
     clear: region => `🟢 <b>All clear</b>\n${region}`,
     yellow: (region, time) => `🟡 <b>Yellow threat level</b>\n${region} • ${time}`,
-    red: (region, time) => `🔴 <b>Air raid alert</b>\n${region} • ${time}`,
+    red: (region, time) => `🔴 <b>Red threat level</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>All clear</b>\n${region} • ${start}–${end} • ${duration}`,
     enabled: "✅ Telegram notifications enabled",
     unsubscribed: "❌ Telegram notifications disabled",
@@ -929,6 +956,8 @@ async function handleTelegramWebhookInner(request, env) {
     const dashIdx = payload.lastIndexOf("-");
     const deviceId = dashIdx >= 0 ? payload.slice(0, dashIdx) : payload;
     const lang = normLang(dashIdx >= 0 ? payload.slice(dashIdx + 1) : (message.from && message.from.language_code));
+
+    await sendTelegramTracked(env, chatId, M(lang).linking);
 
     const syncToken = await randomToken();
     await env.USERS.put(
@@ -1140,23 +1169,6 @@ async function adminData(env, request, full, kvTest, probeUp) {
   return out;
 }
 
-function versionCompare(a, b) {
-  const pa = String(a || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
-  const pb = String(b || "0").replace(/^v/i, "").split(/[.+-]/).map(x => Number.parseInt(x, 10) || 0);
-  for (let i=0;i<Math.max(pa.length,pb.length);i++) { const x=pa[i]||0,y=pb[i]||0; if(x!==y)return x<y?-1:1; }
-  return 0;
-}
-async function getPluginVersion(env) {
-  const row = await env.DB.prepare("SELECT latest_version, minimum_version, changelog, update_url, updated_at FROM plugin_versions WHERE id=1").first();
-  let update_check_enabled = false;
-  try {
-    const setting = await env.DB.prepare("SELECT update_check_enabled FROM plugin_version_settings WHERE id=1").first();
-    update_check_enabled = !!(setting && Number(setting.update_check_enabled) === 1);
-  } catch (_) { }
-  return { ...(row || { latest_version: "1.0.0", minimum_version: "1.0.0", changelog: "", update_url: "https://t.me/excess_plugins/100", updated_at: null }), update_check_enabled };
-}
-
-
 async function handleAdmin(request, env, url) {
   const p = url.pathname;
   if (!env.ADMIN_TOKEN) return new Response("Admin disabled: set the ADMIN_TOKEN secret", { status: 404 });
@@ -1179,21 +1191,6 @@ async function handleAdmin(request, env, url) {
     const id = userMatch[1];
     const user = await readUser(env, `user:${id}`);
     return adminJson({ok:true,telegram_id:id,profile:user||null,telegram_connected:!!(user && user.telegram_connected !== false)});
-  }
-  if (p === "/admin/version" && request.method === "GET") {
-    try { return adminJson({ok:true, ...(await getPluginVersion(env))}); } catch(e) { return adminJson({error:String(e)},500); }
-  }
-  if (p === "/admin/version" && request.method === "POST") {
-    try {
-      const b = await request.json(); const latest=String(b.latest_version||"").trim(); const minimum=String(b.minimum_version||"").trim(); const changelog=String(b.changelog||"").slice(0,10000); const updateUrl=String(b.update_url||"https://t.me/excess_plugins/100").trim(); const updateCheckEnabled = b.update_check_enabled === true;
-      if (!/^v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(latest) || !/^v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(minimum)) return adminJson({error:"versions must use semantic version format, e.g. 1.2.3"},400);
-      if (versionCompare(minimum,latest)>0) return adminJson({error:"minimum_version cannot exceed latest_version"},400);
-      let parsedUpdateUrl; try { parsedUpdateUrl = new URL(updateUrl); } catch (_) { return adminJson({error:"update_url must be a valid HTTPS URL"},400); }
-      if (parsedUpdateUrl.protocol !== "https:" || parsedUpdateUrl.username || parsedUpdateUrl.password) return adminJson({error:"update_url must be a valid HTTPS URL"},400);
-      await env.DB.prepare("INSERT INTO plugin_versions (id,latest_version,minimum_version,changelog,update_url,updated_at) VALUES (1,?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET latest_version=excluded.latest_version,minimum_version=excluded.minimum_version,changelog=excluded.changelog,update_url=excluded.update_url,updated_at=excluded.updated_at").bind(latest,minimum,changelog,parsedUpdateUrl.toString(),new Date().toISOString()).run();
-      await env.DB.prepare("INSERT INTO plugin_version_settings (id,update_check_enabled,updated_at) VALUES (1,?1,?2) ON CONFLICT(id) DO UPDATE SET update_check_enabled=excluded.update_check_enabled,updated_at=excluded.updated_at").bind(updateCheckEnabled ? 1 : 0,new Date().toISOString()).run();
-      return adminJson({ok:true,latest_version:latest,minimum_version:minimum,changelog,update_url:parsedUpdateUrl.toString(),update_check_enabled:updateCheckEnabled});
-    } catch(e) { return adminJson({error:String(e)},500); }
   }
   if (p === "/admin") return new Response(ADMIN_HTML, { headers: {
     "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
@@ -1473,12 +1470,6 @@ export default {
       return json(out);
     }
 
-    if (url.pathname === "/plugin/version" && method === "GET") {
-      try {
-        const v=await getPluginVersion(env); const installed=url.searchParams.get("version")||"0.0.0";
-        return json({ok:true,update_check_enabled:v.update_check_enabled,latest_version:v.latest_version,minimum_version:v.minimum_version,update_url:v.update_url||"https://t.me/excess_plugins/100",changelog:v.changelog||"",updated_at:v.updated_at||null,installed_version:installed,update_available:v.update_check_enabled && versionCompare(installed,v.latest_version)<0,update_required:v.update_check_enabled && versionCompare(installed,v.minimum_version)<0});
-      } catch(e) { return json({error:"version service unavailable",detail:String(e)},500); }
-    }
         if (url.pathname === "/api") {
       try {
         return json(await getPublicAlerts(env, request, ctx));
@@ -1555,7 +1546,6 @@ export default {
           region_name: hasLocation ? (region_name || "Unknown") : null,
           lang,
           notify,
-          plugin_version: body.plugin_version ? String(body.plugin_version).slice(0, 40) : (existing && existing.plugin_version) || null,
           last_activity: new Date().toISOString(),
           telegram_connected: true,
           registered_at: existing && existing.registered_at ? existing.registered_at : new Date().toISOString(),
@@ -1599,18 +1589,11 @@ export default {
           await sendNotifications();
         }
 
-        let pluginVersionPolicy = null;
-        try {
-          const policy = await getPluginVersion(env);
-          const installed = String(body.plugin_version || (existing && existing.plugin_version) || "0.0.0");
-          pluginVersionPolicy = { update_check_enabled: policy.update_check_enabled, latest_version: policy.latest_version, minimum_version: policy.minimum_version, update_url: policy.update_url || "https://t.me/excess_plugins/100", changelog: policy.changelog || "", update_available: policy.update_check_enabled && versionCompare(installed, policy.latest_version) < 0, update_required: policy.update_check_enabled && versionCompare(installed, policy.minimum_version) < 0 };
-        } catch (e) { console.error("[plugin-version] policy unavailable during register:", e); }
         return json({
           ok: true,
           changed,
           notify,
           sync_token: token,
-          plugin_version_policy: pluginVersionPolicy,
           status: {
             state: hasLocation ? status.state : null,
             active: hasLocation ? status.state !== "clear" : null,
