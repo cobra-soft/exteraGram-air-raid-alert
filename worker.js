@@ -27,7 +27,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-10-08";
+const WORKER_VERSION = "air-raid-panel-2026-10-01";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -707,16 +707,21 @@ async function deliverChange(env, job, now) {
 
 async function notifyUsers(env, previousData, data, now) {
   const jobs = [];
-  const allUsers = await listUsers(env);
-  for (const user of allUsers) {
-    if (!user || !user.chat_id || !user.oblast_key) continue;
-    if (user.notify === false) continue;
-    const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-    const knownState = user.last_alert_state || "clear";
-    if (knownState === newStatus.state) continue;
-    const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
-    jobs.push({ key: user.chat_id, user, oldStatus, newStatus });
-  }
+  let cursor;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const item of page.keys || []) {
+      const user = item.metadata || await readUser(env, item.name);
+      if (!user || !user.chat_id || !user.oblast_key) continue;
+      if (user.notify === false) continue;
+      const newStatus = alertStatus(data, user.oblast_key, user.district_key);
+      const knownState = user.last_alert_state || "clear";
+      if (knownState === newStatus.state) continue;
+      const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
+      jobs.push({ key: item.name, user, oldStatus, newStatus });
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
 
   let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
@@ -835,69 +840,34 @@ async function sendTelegramTracked(env, chatId, text) {
   return await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
 }
 
-const USER_COLUMNS = [
-  "chat_id", "sync_token", "oblast_key", "district_key", "region_name", "lang", "notify",
-  "last_activity", "telegram_connected", "telegram_username", "telegram_first_name", "telegram_last_name",
-  "registered_at", "last_check", "last_alert_state", "last_alert_active", "last_alert_start", "last_alert_end"
-];
-const USER_BOOL_COLUMNS = new Set(["notify", "telegram_connected", "last_alert_active"]);
-
-function rowToUser(row) {
-  if (!row) return null;
-  const user = {};
-  for (const col of USER_COLUMNS) {
-    user[col] = USER_BOOL_COLUMNS.has(col) ? !!row[col] : row[col];
+async function readUser(env, key) {
+  try {
+    const result = await env.USERS.getWithMetadata(key);
+    if (!result) return null;
+    
+    let userData = result.metadata;
+    if (typeof userData === "string") {
+      try {
+        userData = JSON.parse(userData);
+      } catch (parseErr) {
+        console.error(`[user] failed to parse metadata for ${key}:`, parseErr);
+        return null;
+      }
+    }
+    
+    if (userData && typeof userData === "object") return userData;
+  } catch (e) {
+    console.error(`[user] read error for ${key}:`, e);
   }
-  return user;
+  return null;
 }
 
-async function readUser(env, chatId) {
+async function writeUser(env, key, user) {
   try {
-    const row = await env.DB.prepare("SELECT * FROM users WHERE chat_id = ?1").bind(String(chatId)).first();
-    return rowToUser(row);
+    await env.USERS.put(key, "", { metadata: user });
   } catch (e) {
-    console.error(`[user] read error for ${chatId}:`, e);
-    return null;
-  }
-}
-
-async function writeUser(env, chatId, user) {
-  try {
-    const data = { ...user, chat_id: String(chatId) };
-    const cols = USER_COLUMNS;
-    const placeholders = cols.map((_, i) => `?${i + 1}`).join(", ");
-    const updates = cols.filter(c => c !== "chat_id").map(c => `${c} = excluded.${c}`).join(", ");
-    const values = cols.map(c => {
-      const v = data[c];
-      if (v === undefined) return null;
-      if (USER_BOOL_COLUMNS.has(c)) return v ? 1 : 0;
-      return v;
-    });
-    await env.DB.prepare(
-      `INSERT INTO users (${cols.join(", ")}) VALUES (${placeholders}) ON CONFLICT(chat_id) DO UPDATE SET ${updates}`
-    ).bind(...values).run();
-  } catch (e) {
-    console.error(`[user] write error for ${chatId}:`, e);
+    console.error(`[user] write error for ${key}:`, e);
     throw e;
-  }
-}
-
-async function deleteUser(env, chatId) {
-  try {
-    await env.DB.prepare("DELETE FROM users WHERE chat_id = ?1").bind(String(chatId)).run();
-  } catch (e) {
-    console.error(`[user] delete error for ${chatId}:`, e);
-    throw e;
-  }
-}
-
-async function listUsers(env) {
-  try {
-    const { results } = await env.DB.prepare("SELECT * FROM users").all();
-    return (results || []).map(rowToUser);
-  } catch (e) {
-    console.error("[user] list error:", e);
-    return [];
   }
 }
 
@@ -970,9 +940,9 @@ async function handleTelegramWebhookInner(request, env) {
   if (!message || !message.chat) return json({ ok: true });
   if (message.chat.type === "private" && message.from && message.from.id != null && String(message.from.id) === String(message.chat.id)) {
     try {
-      const chatIdKey = message.chat.id;
-      const user = await readUser(env, chatIdKey);
-      if (user) await writeUser(env, chatIdKey, {
+      const key = `user:${message.chat.id}`;
+      const user = await readUser(env, key);
+      if (user) await writeUser(env, key, {
         ...user,
         telegram_username: message.from.username || user.telegram_username || null,
         telegram_first_name: message.from.first_name || user.telegram_first_name || null,
@@ -1005,7 +975,7 @@ async function handleTelegramWebhookInner(request, env) {
   } else if (command === "/start") {
     await sendTelegramTracked(env, chatId, M(message.from && message.from.language_code).genericStart);
   } else if (command === "/status") {
-    const user = await readUser(env, chatId);
+    const user = await readUser(env, `user:${chatId}`);
     const lang = normLang(message.from && message.from.language_code || (user && user.lang));
     const m = M(lang);
     if (!user || !user.oblast_key) {
@@ -1150,19 +1120,25 @@ function adminJson(body, status = 200) {
 
 async function collectUsers(env, data) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
-  const allUsers = await listUsers(env);
-  for (const u of allUsers) {
-    if (!u) continue;
-    st.total++;
-    if (u.notify === false) st.notifyOff++;
-    if (!u.oblast_key) { st.noRegion++; continue; }
-    const lang = normLang(u.lang);
-    st.byLang[lang] = (st.byLang[lang] || 0) + 1;
-    const known = u.last_alert_state || "clear";
-    st.byState[known] = (st.byState[known] || 0) + 1;
-    st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
-    if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
-  }
+  let cursor, pages = 0;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const it of page.keys || []) {
+      const u = it.metadata;
+      if (!u) continue;
+      st.total++;
+      if (u.notify === false) st.notifyOff++;
+      if (!u.oblast_key) { st.noRegion++; continue; }
+      const lang = normLang(u.lang);
+      st.byLang[lang] = (st.byLang[lang] || 0) + 1;
+      const known = u.last_alert_state || "clear";
+      st.byState[known] = (st.byState[known] || 0) + 1;
+      st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
+      if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
+    }
+    cursor = page.list_complete ? null : page.cursor;
+    if (cursor && ++pages >= 10) { st.truncated = true; break; }
+  } while (cursor);
   st.byOblast = Object.entries(st.byOblast).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => ({ key: k, name: OBLAST_NAMES_UK[k] || k, n }));
   return st;
 }
@@ -1224,7 +1200,7 @@ async function handleAdmin(request, env, url) {
   const userMatch = p.match(/^\/admin\/users\/(-?\d+)$/);
   if (userMatch && request.method === "GET") {
     const id = userMatch[1];
-    const user = await readUser(env, id);
+    const user = await readUser(env, `user:${id}`);
     return adminJson({ok:true,telegram_id:id,profile:user||null,telegram_connected:!!(user && user.telegram_connected !== false)});
   }
   if (p === "/admin") return new Response(ADMIN_HTML, { headers: {
@@ -1238,106 +1214,6 @@ async function handleAdmin(request, env, url) {
   if (p === "/admin/action" && request.method === "POST") {
     const name = url.searchParams.get("name");
     if (name === "setup-webhook") return await handleSetupWebhook(request, env);
-    if (name === "debug-kv-users") {
-      const out = [];
-      const errors = [];
-      let cursor;
-      do {
-        const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-        for (const item of page.keys || []) {
-          let valueText = null;
-          let value = null;
-          let valueErr = null;
-          try {
-            valueText = await env.USERS.get(item.name);
-            if (valueText != null) {
-              try { value = JSON.parse(valueText); }
-              catch (e) { valueErr = "invalid JSON: " + String(e); }
-            }
-          } catch (e) {
-            valueErr = String(e);
-          }
-
-          const chatId = item.name.slice("user:".length);
-          const validObject = !!value && typeof value === "object" && !Array.isArray(value);
-          if (valueErr) errors.push({ name: item.name, error: valueErr });
-
-          out.push({
-            name: item.name,
-            chatId,
-            validObject,
-            expiration: item.expiration || null,
-            metadata: item.metadata === undefined ? null : item.metadata,
-            valueLength: valueText == null ? null : valueText.length,
-            valueSample: valueText == null ? null : valueText.slice(0, 500),
-            valueErr
-          });
-        }
-        cursor = page.list_complete ? null : page.cursor;
-      } while (cursor);
-
-      return adminJson({
-        ok: true,
-        total: out.length,
-        readable: out.filter(x => x.valueErr == null && x.validObject).length,
-        invalid: out.filter(x => x.valueErr != null || !x.validObject).length,
-        errors,
-        keys: out
-      });
-    }
-    if (name === "migrate-users-kv-to-d1") {
-      const purge = url.searchParams.get("purge") === "1";
-      const migrated = [];
-      const verified = [];
-      const errors = [];
-      let kvTotal = 0;
-      let cursor;
-
-      do {
-        const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-
-        for (const item of page.keys || []) {
-          kvTotal++;
-          const chatId = item.name.slice("user:".length);
-
-          try {
-            const userData = await env.USERS.get(item.name, "json");
-            if (!userData || typeof userData !== "object" || Array.isArray(userData)) {
-              errors.push({ chatId, error: "invalid or empty KV value" });
-              continue;
-            }
-
-            await writeUser(env, chatId, userData);
-
-            // Read the row back before considering the migration successful.
-            const check = await readUser(env, chatId);
-            if (!check) {
-              errors.push({ chatId, error: "D1 write completed but verification read returned no user" });
-              continue;
-            }
-
-            migrated.push(chatId);
-            verified.push(chatId);
-
-            // KV is only deleted after a successful D1 write + read-back.
-            if (purge) await env.USERS.delete(item.name);
-          } catch (e) {
-            errors.push({ chatId, error: String(e && e.message || e) });
-          }
-        }
-
-        cursor = page.list_complete ? null : page.cursor;
-      } while (cursor);
-
-      return adminJson({
-        ok: errors.length === 0,
-        kvTotal,
-        migrated,
-        verified,
-        purged: purge && errors.length === 0,
-        errors
-      });
-    }
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
       return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
@@ -1521,10 +1397,8 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="migrateUsers(false)">Мигрировать KV→D1</button><button class="btn o" onclick="migrateUsers(true)">Мигрировать KV→D1 (purge)</button><button class="btn o" onclick="debugKv()">Проверить KV users</button></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
- if(S.kvDebug)o+=card("KV users · диагностика",kv("Всего KV user:*",S.kvDebug.total)+kv("Корректных объектов",S.kvDebug.readable,"ok")+(S.kvDebug.invalid?kv("Проблемных записей",S.kvDebug.invalid,"bad"):"")+((S.kvDebug.errors||[]).length?'<pre>'+esc(JSON.stringify(S.kvDebug.errors,null,2))+'</pre>':"")+ '<pre>'+esc(JSON.stringify(S.kvDebug.keys||[],null,2))+'</pre>');
- if(S.migration)o+=card("KV → D1 · результат",kv("KV записей",S.migration.kvTotal)+kv("Перенесено",((S.migration.migrated||[]).length))+kv("Проверено чтением D1",((S.migration.verified||[]).length),"ok")+kv("Удалено из KV",S.migration.purged?"да":"нет",S.migration.purged?"warn":"ok")+(S.migration.errors&&S.migration.errors.length?'<pre>'+esc(JSON.stringify(S.migration.errors,null,2))+'</pre>':kv("Ошибки","нет","ok")));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
  var w=f.webhook;if(w){var i=w.info||{};o+=card("Telegram webhook",w.ok?kv("URL",i.url||"не задан",i.url?"":"bad")+kv("В очереди",i.pending_update_count,i.pending_update_count>0?"warn":"ok")+kv("Последняя ошибка",i.last_error_message||"нет",i.last_error_message?"bad":"ok")+kv("Когда",i.last_error_date?dtm(i.last_error_date*1000):"—")+kv("Макс. соединений",i.max_connections)+kv("Ответ",w.ms+" мс"):kv("Ошибка",w.error,"bad"))}
@@ -1543,30 +1417,6 @@ function load(full,kv,quiet,up){busy(1);
   S.d=d;draw();if(full&&!quiet)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
 function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
  $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){snack(name+": "+(j.ok?"успешно":JSON.stringify(j).slice(0,120)));load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
-function debugKv(){
- busy(1);
- fetch("/admin/action?name=debug-kv-users",{method:"POST",cache:"no-store"}).then(function(r){
-  return r.json().then(function(j){return {status:r.status,data:j}})
- }).then(function(x){
-  if(x.status!==200||!x.data.ok)throw new Error(x.data&&x.data.error||"KV debug failed");
-  S.kvDebug=x.data;
-  draw();
-  snack("KV users: "+x.data.total+" записей");
- }).catch(function(e){snack("Ошибка KV: "+e)}).then(function(){busy(-1)})
-}
-function migrateUsers(purge){
- if(!confirm(purge?"Перенести пользователей KV→D1 и удалить старые KV-записи?":"Перенести пользователей KV→D1 (без удаления старых KV-записей)?"))return;
- busy(1);
- fetch("/admin/action?name=migrate-users-kv-to-d1"+(purge?"&purge=1":""),{method:"POST",cache:"no-store"}).then(function(r){
-  return r.json().then(function(j){return {status:r.status,data:j}})
- }).then(function(x){
-  if(x.status!==200)throw new Error(x.data&&x.data.error||"Migration failed");
-  S.migration=x.data;
-  draw();
-  snack((x.data.ok?"Миграция завершена: ":"Миграция завершена с ошибками: ")+((x.data.migrated||[]).length));
-  load(true,false,true);
- }).catch(function(e){snack("Ошибка миграции: "+e)}).then(function(){busy(-1)})
-}
 $("dn").onclick=function(){$("scrim").classList.remove("on")};
 $("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
 $("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};$("fab").onclick=function(){load(true)};
@@ -1656,7 +1506,7 @@ export default {
         const { chat_id, oblast_key, district_key, region_name, sync_token } = body;
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const key = String(chat_id);
+        const key = `user:${chat_id}`;
         const existing = await readUser(env, key);
         const lang = body.lang ? normLang(body.lang) : normLang(existing && existing.lang);
 
@@ -1774,13 +1624,13 @@ export default {
         const { chat_id, sync_token } = await request.json();
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const existing = await readUser(env, chat_id);
+        const existing = await readUser(env, `user:${chat_id}`);
         if (!existing) return json({ ok: true, existed: false });
         if (existing.sync_token && !validSyncToken(existing, sync_token)) {
           return json({ error: "invalid sync token" }, 403);
         }
 
-        await deleteUser(env, chat_id);
+        await env.USERS.delete(`user:${chat_id}`);
         await sendTelegramTracked(env, chat_id, M(existing.lang).unsubscribed);
 
         return json({ ok: true, existed: true });
@@ -1794,7 +1644,7 @@ export default {
         const { chat_id, sync_token } = await request.json();
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const existing = await readUser(env, chat_id);
+        const existing = await readUser(env, `user:${chat_id}`);
         if (!existing) return json({ error: "no user record found on server, reconnect telegram" }, 403);
         if (!validSyncToken(existing, sync_token)) return json({ error: "sync token mismatch, reconnect telegram" }, 403);
         if (!(await checkAndSetEphemeralFlag(`test:${chat_id}`, 15))) {
