@@ -1238,6 +1238,28 @@ async function handleAdmin(request, env, url) {
   if (p === "/admin/action" && request.method === "POST") {
     const name = url.searchParams.get("name");
     if (name === "setup-webhook") return await handleSetupWebhook(request, env);
+    if (name === "debug-kv-users") {
+      const out = [];
+      let cursor;
+      do {
+        const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+        for (const item of page.keys || []) {
+          let valueText = null, valueErr = null;
+          try { valueText = await env.USERS.get(item.name); } catch (e) { valueErr = String(e); }
+          out.push({
+            name: item.name,
+            expiration: item.expiration || null,
+            metadataType: typeof item.metadata,
+            metadata: item.metadata === undefined ? null : item.metadata,
+            valueLength: valueText == null ? null : valueText.length,
+            valueSample: valueText == null ? null : valueText.slice(0, 500),
+            valueErr
+          });
+        }
+        cursor = page.list_complete ? null : page.cursor;
+      } while (cursor);
+      return adminJson({ ok: true, keys: out });
+    }
     if (name === "migrate-users-kv-to-d1") {
       const purge = url.searchParams.get("purge") === "1";
       const migrated = [];
@@ -1444,7 +1466,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="migrateUsers(false)">Мигрировать KV→D1</button><button class="btn o" onclick="migrateUsers(true)">Мигрировать KV→D1 (purge)</button></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="migrateUsers(false)">Мигрировать KV→D1</button><button class="btn o" onclick="migrateUsers(true)">Мигрировать KV→D1 (purge)</button><button class="btn o" onclick="debugKv()">Отладка KV user:*</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
@@ -1464,6 +1486,12 @@ function load(full,kv,quiet,up){busy(1);
   S.d=d;draw();if(full&&!quiet)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
 function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
  $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){snack(name+": "+(j.ok?"успешно":JSON.stringify(j).slice(0,120)));load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
+function debugKv(){
+ busy(1);
+ fetch("/admin/action?name=debug-kv-users",{method:"POST"}).then(function(r){return r.json()}).then(function(j){
+  alert(JSON.stringify(j.keys||j,null,2).slice(0,3500));
+ }).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})
+}
 function migrateUsers(purge){
  if(!confirm(purge?"Перенести пользователей KV→D1 и удалить старые KV-записи?":"Перенести пользователей KV→D1 (без удаления старых KV-записей)?"))return;
  busy(1);
