@@ -707,21 +707,16 @@ async function deliverChange(env, job, now) {
 
 async function notifyUsers(env, previousData, data, now) {
   const jobs = [];
-  let cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const user = item.metadata || await readUser(env, item.name);
-      if (!user || !user.chat_id || !user.oblast_key) continue;
-      if (user.notify === false) continue;
-      const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-      const knownState = user.last_alert_state || "clear";
-      if (knownState === newStatus.state) continue;
-      const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
-      jobs.push({ key: item.name, user, oldStatus, newStatus });
-    }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
+  const allUsers = await listUsers(env);
+  for (const user of allUsers) {
+    if (!user || !user.chat_id || !user.oblast_key) continue;
+    if (user.notify === false) continue;
+    const newStatus = alertStatus(data, user.oblast_key, user.district_key);
+    const knownState = user.last_alert_state || "clear";
+    if (knownState === newStatus.state) continue;
+    const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
+    jobs.push({ key: user.chat_id, user, oldStatus, newStatus });
+  }
 
   let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
@@ -840,34 +835,69 @@ async function sendTelegramTracked(env, chatId, text) {
   return await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
 }
 
-async function readUser(env, key) {
-  try {
-    const result = await env.USERS.getWithMetadata(key);
-    if (!result) return null;
-    
-    let userData = result.metadata;
-    if (typeof userData === "string") {
-      try {
-        userData = JSON.parse(userData);
-      } catch (parseErr) {
-        console.error(`[user] failed to parse metadata for ${key}:`, parseErr);
-        return null;
-      }
-    }
-    
-    if (userData && typeof userData === "object") return userData;
-  } catch (e) {
-    console.error(`[user] read error for ${key}:`, e);
+const USER_COLUMNS = [
+  "chat_id", "sync_token", "oblast_key", "district_key", "region_name", "lang", "notify",
+  "last_activity", "telegram_connected", "telegram_username", "telegram_first_name", "telegram_last_name",
+  "registered_at", "last_check", "last_alert_state", "last_alert_active", "last_alert_start", "last_alert_end"
+];
+const USER_BOOL_COLUMNS = new Set(["notify", "telegram_connected", "last_alert_active"]);
+
+function rowToUser(row) {
+  if (!row) return null;
+  const user = {};
+  for (const col of USER_COLUMNS) {
+    user[col] = USER_BOOL_COLUMNS.has(col) ? !!row[col] : row[col];
   }
-  return null;
+  return user;
 }
 
-async function writeUser(env, key, user) {
+async function readUser(env, chatId) {
   try {
-    await env.USERS.put(key, "", { metadata: user });
+    const row = await env.DB.prepare("SELECT * FROM users WHERE chat_id = ?1").bind(String(chatId)).first();
+    return rowToUser(row);
   } catch (e) {
-    console.error(`[user] write error for ${key}:`, e);
+    console.error(`[user] read error for ${chatId}:`, e);
+    return null;
+  }
+}
+
+async function writeUser(env, chatId, user) {
+  try {
+    const data = { ...user, chat_id: String(chatId) };
+    const cols = USER_COLUMNS;
+    const placeholders = cols.map((_, i) => `?${i + 1}`).join(", ");
+    const updates = cols.filter(c => c !== "chat_id").map(c => `${c} = excluded.${c}`).join(", ");
+    const values = cols.map(c => {
+      const v = data[c];
+      if (v === undefined) return null;
+      if (USER_BOOL_COLUMNS.has(c)) return v ? 1 : 0;
+      return v;
+    });
+    await env.DB.prepare(
+      `INSERT INTO users (${cols.join(", ")}) VALUES (${placeholders}) ON CONFLICT(chat_id) DO UPDATE SET ${updates}`
+    ).bind(...values).run();
+  } catch (e) {
+    console.error(`[user] write error for ${chatId}:`, e);
     throw e;
+  }
+}
+
+async function deleteUser(env, chatId) {
+  try {
+    await env.DB.prepare("DELETE FROM users WHERE chat_id = ?1").bind(String(chatId)).run();
+  } catch (e) {
+    console.error(`[user] delete error for ${chatId}:`, e);
+    throw e;
+  }
+}
+
+async function listUsers(env) {
+  try {
+    const { results } = await env.DB.prepare("SELECT * FROM users").all();
+    return (results || []).map(rowToUser);
+  } catch (e) {
+    console.error("[user] list error:", e);
+    return [];
   }
 }
 
@@ -940,9 +970,9 @@ async function handleTelegramWebhookInner(request, env) {
   if (!message || !message.chat) return json({ ok: true });
   if (message.chat.type === "private" && message.from && message.from.id != null && String(message.from.id) === String(message.chat.id)) {
     try {
-      const key = `user:${message.chat.id}`;
-      const user = await readUser(env, key);
-      if (user) await writeUser(env, key, {
+      const chatIdKey = message.chat.id;
+      const user = await readUser(env, chatIdKey);
+      if (user) await writeUser(env, chatIdKey, {
         ...user,
         telegram_username: message.from.username || user.telegram_username || null,
         telegram_first_name: message.from.first_name || user.telegram_first_name || null,
@@ -975,7 +1005,7 @@ async function handleTelegramWebhookInner(request, env) {
   } else if (command === "/start") {
     await sendTelegramTracked(env, chatId, M(message.from && message.from.language_code).genericStart);
   } else if (command === "/status") {
-    const user = await readUser(env, `user:${chatId}`);
+    const user = await readUser(env, chatId);
     const lang = normLang(message.from && message.from.language_code || (user && user.lang));
     const m = M(lang);
     if (!user || !user.oblast_key) {
@@ -1120,25 +1150,19 @@ function adminJson(body, status = 200) {
 
 async function collectUsers(env, data) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
-  let cursor, pages = 0;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const it of page.keys || []) {
-      const u = it.metadata;
-      if (!u) continue;
-      st.total++;
-      if (u.notify === false) st.notifyOff++;
-      if (!u.oblast_key) { st.noRegion++; continue; }
-      const lang = normLang(u.lang);
-      st.byLang[lang] = (st.byLang[lang] || 0) + 1;
-      const known = u.last_alert_state || "clear";
-      st.byState[known] = (st.byState[known] || 0) + 1;
-      st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
-      if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
-    }
-    cursor = page.list_complete ? null : page.cursor;
-    if (cursor && ++pages >= 10) { st.truncated = true; break; }
-  } while (cursor);
+  const allUsers = await listUsers(env);
+  for (const u of allUsers) {
+    if (!u) continue;
+    st.total++;
+    if (u.notify === false) st.notifyOff++;
+    if (!u.oblast_key) { st.noRegion++; continue; }
+    const lang = normLang(u.lang);
+    st.byLang[lang] = (st.byLang[lang] || 0) + 1;
+    const known = u.last_alert_state || "clear";
+    st.byState[known] = (st.byState[known] || 0) + 1;
+    st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
+    if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
+  }
   st.byOblast = Object.entries(st.byOblast).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => ({ key: k, name: OBLAST_NAMES_UK[k] || k, n }));
   return st;
 }
@@ -1200,7 +1224,7 @@ async function handleAdmin(request, env, url) {
   const userMatch = p.match(/^\/admin\/users\/(-?\d+)$/);
   if (userMatch && request.method === "GET") {
     const id = userMatch[1];
-    const user = await readUser(env, `user:${id}`);
+    const user = await readUser(env, id);
     return adminJson({ok:true,telegram_id:id,profile:user||null,telegram_connected:!!(user && user.telegram_connected !== false)});
   }
   if (p === "/admin") return new Response(ADMIN_HTML, { headers: {
@@ -1214,6 +1238,30 @@ async function handleAdmin(request, env, url) {
   if (p === "/admin/action" && request.method === "POST") {
     const name = url.searchParams.get("name");
     if (name === "setup-webhook") return await handleSetupWebhook(request, env);
+    if (name === "migrate-users-kv-to-d1") {
+      const purge = url.searchParams.get("purge") === "1";
+      const migrated = [];
+      const errors = [];
+      let cursor;
+      do {
+        const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+        for (const item of page.keys || []) {
+          const chatId = item.name.slice("user:".length);
+          try {
+            let userData = item.metadata;
+            if (typeof userData === "string") userData = JSON.parse(userData);
+            if (!userData || typeof userData !== "object") { errors.push({ chatId, error: "no metadata" }); continue; }
+            await writeUser(env, chatId, userData);
+            migrated.push(chatId);
+            if (purge) await env.USERS.delete(item.name);
+          } catch (e) {
+            errors.push({ chatId, error: String(e) });
+          }
+        }
+        cursor = page.list_complete ? null : page.cursor;
+      } while (cursor);
+      return adminJson({ ok: true, migrated, purged: purge, errors });
+    }
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
       return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
@@ -1506,7 +1554,7 @@ export default {
         const { chat_id, oblast_key, district_key, region_name, sync_token } = body;
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const key = `user:${chat_id}`;
+        const key = String(chat_id);
         const existing = await readUser(env, key);
         const lang = body.lang ? normLang(body.lang) : normLang(existing && existing.lang);
 
@@ -1624,13 +1672,13 @@ export default {
         const { chat_id, sync_token } = await request.json();
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const existing = await readUser(env, `user:${chat_id}`);
+        const existing = await readUser(env, chat_id);
         if (!existing) return json({ ok: true, existed: false });
         if (existing.sync_token && !validSyncToken(existing, sync_token)) {
           return json({ error: "invalid sync token" }, 403);
         }
 
-        await env.USERS.delete(`user:${chat_id}`);
+        await deleteUser(env, chat_id);
         await sendTelegramTracked(env, chat_id, M(existing.lang).unsubscribed);
 
         return json({ ok: true, existed: true });
@@ -1644,7 +1692,7 @@ export default {
         const { chat_id, sync_token } = await request.json();
         if (!chat_id) return json({ error: "missing chat_id" }, 400);
 
-        const existing = await readUser(env, `user:${chat_id}`);
+        const existing = await readUser(env, chat_id);
         if (!existing) return json({ error: "no user record found on server, reconnect telegram" }, 403);
         if (!validSyncToken(existing, sync_token)) return json({ error: "sync token mismatch, reconnect telegram" }, 403);
         if (!(await checkAndSetEphemeralFlag(`test:${chat_id}`, 15))) {
