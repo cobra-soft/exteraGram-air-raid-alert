@@ -27,7 +27,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-10-01";
+const WORKER_VERSION = "air-raid-panel-2026-10-08";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1240,16 +1240,33 @@ async function handleAdmin(request, env, url) {
     if (name === "setup-webhook") return await handleSetupWebhook(request, env);
     if (name === "debug-kv-users") {
       const out = [];
+      const errors = [];
       let cursor;
       do {
         const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
         for (const item of page.keys || []) {
-          let valueText = null, valueErr = null;
-          try { valueText = await env.USERS.get(item.name); } catch (e) { valueErr = String(e); }
+          let valueText = null;
+          let value = null;
+          let valueErr = null;
+          try {
+            valueText = await env.USERS.get(item.name);
+            if (valueText != null) {
+              try { value = JSON.parse(valueText); }
+              catch (e) { valueErr = "invalid JSON: " + String(e); }
+            }
+          } catch (e) {
+            valueErr = String(e);
+          }
+
+          const chatId = item.name.slice("user:".length);
+          const validObject = !!value && typeof value === "object" && !Array.isArray(value);
+          if (valueErr) errors.push({ name: item.name, error: valueErr });
+
           out.push({
             name: item.name,
+            chatId,
+            validObject,
             expiration: item.expiration || null,
-            metadataType: typeof item.metadata,
             metadata: item.metadata === undefined ? null : item.metadata,
             valueLength: valueText == null ? null : valueText.length,
             valueSample: valueText == null ? null : valueText.slice(0, 500),
@@ -1258,30 +1275,68 @@ async function handleAdmin(request, env, url) {
         }
         cursor = page.list_complete ? null : page.cursor;
       } while (cursor);
-      return adminJson({ ok: true, keys: out });
+
+      return adminJson({
+        ok: true,
+        total: out.length,
+        readable: out.filter(x => x.valueErr == null && x.validObject).length,
+        invalid: out.filter(x => x.valueErr != null || !x.validObject).length,
+        errors,
+        keys: out
+      });
     }
     if (name === "migrate-users-kv-to-d1") {
       const purge = url.searchParams.get("purge") === "1";
       const migrated = [];
+      const verified = [];
       const errors = [];
+      let kvTotal = 0;
       let cursor;
+
       do {
         const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+
         for (const item of page.keys || []) {
+          kvTotal++;
           const chatId = item.name.slice("user:".length);
+
           try {
             const userData = await env.USERS.get(item.name, "json");
-            if (!userData || typeof userData !== "object") { errors.push({ chatId, error: "empty value" }); continue; }
+            if (!userData || typeof userData !== "object" || Array.isArray(userData)) {
+              errors.push({ chatId, error: "invalid or empty KV value" });
+              continue;
+            }
+
             await writeUser(env, chatId, userData);
+
+            // Read the row back before considering the migration successful.
+            const check = await readUser(env, chatId);
+            if (!check) {
+              errors.push({ chatId, error: "D1 write completed but verification read returned no user" });
+              continue;
+            }
+
             migrated.push(chatId);
+            verified.push(chatId);
+
+            // KV is only deleted after a successful D1 write + read-back.
             if (purge) await env.USERS.delete(item.name);
           } catch (e) {
-            errors.push({ chatId, error: String(e) });
+            errors.push({ chatId, error: String(e && e.message || e) });
           }
         }
+
         cursor = page.list_complete ? null : page.cursor;
       } while (cursor);
-      return adminJson({ ok: true, migrated, purged: purge, errors });
+
+      return adminJson({
+        ok: errors.length === 0,
+        kvTotal,
+        migrated,
+        verified,
+        purged: purge && errors.length === 0,
+        errors
+      });
     }
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
@@ -1466,8 +1521,10 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="migrateUsers(false)">Мигрировать KV→D1</button><button class="btn o" onclick="migrateUsers(true)">Мигрировать KV→D1 (purge)</button><button class="btn o" onclick="debugKv()">Отладка KV user:*</button></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="migrateUsers(false)">Мигрировать KV→D1</button><button class="btn o" onclick="migrateUsers(true)">Мигрировать KV→D1 (purge)</button><button class="btn o" onclick="debugKv()">Проверить KV users</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
+ if(S.kvDebug)o+=card("KV users · диагностика",kv("Всего KV user:*",S.kvDebug.total)+kv("Корректных объектов",S.kvDebug.readable,"ok")+(S.kvDebug.invalid?kv("Проблемных записей",S.kvDebug.invalid,"bad"):"")+((S.kvDebug.errors||[]).length?'<pre>'+esc(JSON.stringify(S.kvDebug.errors,null,2))+'</pre>':"")+ '<pre>'+esc(JSON.stringify(S.kvDebug.keys||[],null,2))+'</pre>');
+ if(S.migration)o+=card("KV → D1 · результат",kv("KV записей",S.migration.kvTotal)+kv("Перенесено",((S.migration.migrated||[]).length))+kv("Проверено чтением D1",((S.migration.verified||[]).length),"ok")+kv("Удалено из KV",S.migration.purged?"да":"нет",S.migration.purged?"warn":"ok")+(S.migration.errors&&S.migration.errors.length?'<pre>'+esc(JSON.stringify(S.migration.errors,null,2))+'</pre>':kv("Ошибки","нет","ok")));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
  var w=f.webhook;if(w){var i=w.info||{};o+=card("Telegram webhook",w.ok?kv("URL",i.url||"не задан",i.url?"":"bad")+kv("В очереди",i.pending_update_count,i.pending_update_count>0?"warn":"ok")+kv("Последняя ошибка",i.last_error_message||"нет",i.last_error_message?"bad":"ok")+kv("Когда",i.last_error_date?dtm(i.last_error_date*1000):"—")+kv("Макс. соединений",i.max_connections)+kv("Ответ",w.ms+" мс"):kv("Ошибка",w.error,"bad"))}
@@ -1488,17 +1545,27 @@ function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").cl
  $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){snack(name+": "+(j.ok?"успешно":JSON.stringify(j).slice(0,120)));load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
 function debugKv(){
  busy(1);
- fetch("/admin/action?name=debug-kv-users",{method:"POST"}).then(function(r){return r.json()}).then(function(j){
-  alert(JSON.stringify(j.keys||j,null,2).slice(0,3500));
- }).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})
+ fetch("/admin/action?name=debug-kv-users",{method:"POST",cache:"no-store"}).then(function(r){
+  return r.json().then(function(j){return {status:r.status,data:j}})
+ }).then(function(x){
+  if(x.status!==200||!x.data.ok)throw new Error(x.data&&x.data.error||"KV debug failed");
+  S.kvDebug=x.data;
+  draw();
+  snack("KV users: "+x.data.total+" записей");
+ }).catch(function(e){snack("Ошибка KV: "+e)}).then(function(){busy(-1)})
 }
 function migrateUsers(purge){
  if(!confirm(purge?"Перенести пользователей KV→D1 и удалить старые KV-записи?":"Перенести пользователей KV→D1 (без удаления старых KV-записей)?"))return;
  busy(1);
- fetch("/admin/action?name=migrate-users-kv-to-d1"+(purge?"&purge=1":""),{method:"POST"}).then(function(r){return r.json()}).then(function(j){
-  alert("Migrated: "+((j.migrated||[]).length)+" ("+((j.migrated||[]).join(", ")||"—")+")\\nErrors: "+JSON.stringify(j.errors||[]));
-  load(true,false,true)
- }).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})
+ fetch("/admin/action?name=migrate-users-kv-to-d1"+(purge?"&purge=1":""),{method:"POST",cache:"no-store"}).then(function(r){
+  return r.json().then(function(j){return {status:r.status,data:j}})
+ }).then(function(x){
+  if(x.status!==200)throw new Error(x.data&&x.data.error||"Migration failed");
+  S.migration=x.data;
+  draw();
+  snack((x.data.ok?"Миграция завершена: ":"Миграция завершена с ошибками: ")+((x.data.migrated||[]).length));
+  load(true,false,true);
+ }).catch(function(e){snack("Ошибка миграции: "+e)}).then(function(){busy(-1)})
 }
 $("dn").onclick=function(){$("scrim").classList.remove("on")};
 $("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
