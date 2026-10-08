@@ -973,10 +973,12 @@ async function handleTelegramWebhookInner(request, env) {
       { expirationTtl: DEVICE_LINK_TTL_SECONDS }
     );
   } else if (command === "/start") {
-    await sendTelegramTracked(env, chatId, M(message.from && message.from.language_code).genericStart);
+    const existing = await readUser(env, `user:${chatId}`);
+    const lang = normLang((existing && existing.lang) || (message.from && message.from.language_code));
+    await sendTelegramTracked(env, chatId, M(lang).genericStart);
   } else if (command === "/status") {
     const user = await readUser(env, `user:${chatId}`);
-    const lang = normLang(message.from && message.from.language_code || (user && user.lang));
+    const lang = normLang((user && user.lang) || (message.from && message.from.language_code));
     const m = M(lang);
     if (!user || !user.oblast_key) {
       await sendTelegramTracked(env, chatId, m.statusNoRegion);
@@ -1508,7 +1510,6 @@ export default {
 
         const key = `user:${chat_id}`;
         const existing = await readUser(env, key);
-        const lang = body.lang ? normLang(body.lang) : normLang(existing && existing.lang);
 
         let deviceLink = null;
         if (body.device_id) {
@@ -1517,6 +1518,14 @@ export default {
             deviceLink = candidate;
           }
         }
+
+        // The plugin language is the source of truth. Prefer the language
+        // explicitly sent by the plugin, then the language saved in the
+        // device link created by /start, and only then the existing user.
+        // Telegram's own language is intentionally NOT used here.
+        const lang = body.lang
+          ? normLang(body.lang)
+          : normLang(deviceLink && deviceLink.lang || existing && existing.lang);
 
         if (existing && existing.sync_token && !validSyncToken(existing, sync_token) && !deviceLink) {
           return json({ error: "invalid sync token" }, 403);
