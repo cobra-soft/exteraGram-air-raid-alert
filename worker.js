@@ -920,6 +920,13 @@ async function handleTelegramWebhook(request, env) {
 }
 
 async function handleTelegramWebhookInner(request, env) {
+  if (env.WEBHOOK_SECRET) {
+    const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+    if (!safeEqual(got, env.WEBHOOK_SECRET)) {
+      return json({ ok: false }, 401);
+    }
+  }
+
   let update;
   try {
     update = await request.json();
@@ -991,6 +998,9 @@ async function handleSetupWebhook(request, env) {
   if (!env.BOT_TOKEN) {
     return json({ ok: false, error: "BOT_TOKEN not configured" }, 500);
   }
+  if (!env.WEBHOOK_SECRET) {
+    return json({ ok: false, error: "WEBHOOK_SECRET not configured" }, 500);
+  }
   const target = new URL(request.url);
   target.pathname = "/telegram/webhook";
   target.search = "";
@@ -999,6 +1009,7 @@ async function handleSetupWebhook(request, env) {
   setUrl.searchParams.set("url", target.toString());
   setUrl.searchParams.set("allowed_updates", JSON.stringify(["message", "callback_query"]));
   setUrl.searchParams.set("drop_pending_updates", "true");
+  setUrl.searchParams.set("secret_token", env.WEBHOOK_SECRET);
 
   const r = await fetchWithTimeout(setUrl.toString(), {}, FETCH_TIMEOUT_MS);
   const body = await r.json();
