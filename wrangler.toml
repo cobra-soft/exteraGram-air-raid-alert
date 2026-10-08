@@ -8,7 +8,7 @@ kv_namespaces = [
 ]
 
 d1_databases = [
-  { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
+  { binding = "DB", database_name = "wrangler_d1", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
 [triggers]
