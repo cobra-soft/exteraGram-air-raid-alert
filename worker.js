@@ -22,7 +22,6 @@
  * SOFTWARE.
  */
 
-
 const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
@@ -31,11 +30,7 @@ const WORKER_VERSION = "air-raid-panel-2026-10-01";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
-// If a "clear" state is first noticed more than this long after the last
-// successful poll (worker was down, rate-limited, or alerts.in.ua was
-// unreachable), we can no longer trust "now" as the real end time, so we
-// stop claiming a precise end/duration and say so instead. Keep this a bit
-// above your actual cron interval (see wrangler.toml [triggers] crons).
+
 const DETECTION_GAP_MS = 3 * 60 * 1000;
 const SNAPSHOT_KEY = "alerts-in-ua";
 const DEVICE_LINK_TTL_SECONDS = 600;
@@ -259,11 +254,6 @@ async function d1PutKV(db, key, value) {
   }
 }
 
-// Atomic "claim" for a notification: only the first caller to insert this
-// dedupe key wins. Unlike the old Cache-API flag (per-colo, not global)
-// or reading state from KV (eventually consistent), D1 gives a single
-// consistent source of truth, so duplicate sends are no longer possible
-// even if notifyUsers() runs the same transition twice.
 async function tryClaimNotification(db, dedupeKey) {
   try {
     const res = await db.prepare(
@@ -272,7 +262,15 @@ async function tryClaimNotification(db, dedupeKey) {
     return !!(res && res.meta && res.meta.changes > 0);
   } catch (e) {
     console.error(`[dedupe] claim error for ${dedupeKey}:`, e);
-    return true; // fail open: a D1 hiccup should not silently swallow a real alert
+    return true;
+  }
+}
+
+async function releaseNotificationClaim(db, dedupeKey) {
+  try {
+    await db.prepare("DELETE FROM notified_events WHERE dedupe_key = ?1").bind(dedupeKey).run();
+  } catch (e) {
+    console.error(`[dedupe] release error for ${dedupeKey}:`, e);
   }
 }
 
@@ -393,10 +391,10 @@ async function fetchUpstream(env) {
   }
   const json = await r.json();
   if (!json.alerts) return { alerts: [], oblasts: [], raions: [] };
-  
+
   const oblasts = {};
   const raions = [];
-  
+
   for (const alert of json.alerts) {
     if (alert.alert_type !== 'air_raid') continue;
 
@@ -405,7 +403,7 @@ async function fetchUpstream(env) {
       console.error(`[alerts.in.ua] unknown oblast name: ${alert.location_oblast}`);
       continue;
     }
-    
+
     if (alert.location_type === 'oblast') {
       oblasts[oblastSlug] = {
         key: oblastSlug,
@@ -437,7 +435,7 @@ async function fetchUpstream(env) {
       console.error(`[alerts.in.ua] skipping unmapped location_type "${alert.location_type}" in ${alert.location_oblast}`);
     }
   }
-  
+
   return {
     alerts: json.alerts,
     oblasts: Object.values(oblasts),
@@ -629,9 +627,9 @@ function findAlert(data, oblastKey, districtKey) {
 function alertStatus(data, oblastKey, districtKey) {
   const alert = findAlert(data, oblastKey, districtKey);
   if (!alert) return { state: "clear", since: null };
-  return { 
-    state: alert.alert_level === "yellow" ? "yellow" : "red", 
-    since: alert.started_at 
+  return {
+    state: alert.alert_level === "yellow" ? "yellow" : "red",
+    since: alert.started_at
   };
 }
 
@@ -696,10 +694,7 @@ async function deliverChange(env, job, now, lastCheckedAt) {
   const m = M(user.lang);
   if (newStatus.state === "clear") {
     const start = oldStatus.since || user.last_alert_start;
-    // "now" is only a good stand-in for the real end time if we were polling
-    // recently; if there's a wide gap since the last successful poll (outage,
-    // maintenance, rate limiting), "now" can be arbitrarily later than the
-    // actual clear, so don't claim a precise end time/duration in that case.
+
     const detectionGap = lastCheckedAt ? now - lastCheckedAt : Infinity;
     const uncertain = detectionGap > DETECTION_GAP_MS;
     if (uncertain) {
@@ -707,9 +702,7 @@ async function deliverChange(env, job, now, lastCheckedAt) {
         ? m.clearApprox(user.region_name, start ? formatTimeKyiv(new Date(start)) : null, formatTimeKyiv(new Date(now)))
         : m.clear(user.region_name);
     } else {
-      // Duration is derived from the same minute-truncated timestamps shown to
-      // the user (formatTimeKyiv drops seconds), so the printed start/end and
-      // the printed duration always agree instead of disagreeing by up to a minute.
+
       const startMinuteMs = start ? Math.floor(new Date(start).getTime() / 60000) * 60000 : null;
       const nowMinuteMs = Math.floor(now / 60000) * 60000;
       const duration = startMinuteMs !== null ? formatDuration(nowMinuteMs - startMinuteMs, user.lang) : null;
@@ -725,6 +718,7 @@ async function deliverChange(env, job, now, lastCheckedAt) {
   const claimed = await tryClaimNotification(env.DB, dedupeName);
   const res = !claimed ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
   if (!res.ok && !res.permanent) {
+    if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
     console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry`);
     return false;
   }
@@ -1561,10 +1555,6 @@ export default {
           }
         }
 
-        // The plugin language is the source of truth. Prefer the language
-        // explicitly sent by the plugin, then the language saved in the
-        // device link created by /start, and only then the existing user.
-        // Telegram's own language is intentionally NOT used here.
         const lang = body.lang
           ? normLang(body.lang)
           : normLang(deviceLink && deviceLink.lang || existing && existing.lang);
