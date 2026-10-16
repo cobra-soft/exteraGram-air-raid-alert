@@ -31,6 +31,12 @@ const WORKER_VERSION = "air-raid-panel-2026-10-01";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
+// If a "clear" state is first noticed more than this long after the last
+// successful poll (worker was down, rate-limited, or alerts.in.ua was
+// unreachable), we can no longer trust "now" as the real end time, so we
+// stop claiming a precise end/duration and say so instead. Keep this a bit
+// above your actual cron interval (see wrangler.toml [triggers] crons).
+const DETECTION_GAP_MS = 3 * 60 * 1000;
 const SNAPSHOT_KEY = "alerts-in-ua";
 const DEVICE_LINK_TTL_SECONDS = 600;
 const UPDATE_DEDUP_TTL_SECONDS = 120;
@@ -676,7 +682,7 @@ async function checkAllUsers(env) {
   }
 
   if (changed || needsRetryPass) {
-    const hadFailures = await notifyUsers(env, previous.data, data, now);
+    const hadFailures = await notifyUsers(env, previous.data, data, now, lastWriteAt);
     const retryAfter = hadFailures ? (retryBefore || now) : 0;
     if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
       await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
@@ -684,14 +690,31 @@ async function checkAllUsers(env) {
   }
 }
 
-async function deliverChange(env, job, now) {
+async function deliverChange(env, job, now, lastCheckedAt) {
   const { key, user, oldStatus, newStatus } = job;
   let text;
   const m = M(user.lang);
   if (newStatus.state === "clear") {
     const start = oldStatus.since || user.last_alert_start;
-    const duration = start ? formatDuration(now - new Date(start).getTime(), user.lang) : null;
-    text = duration ? m.clearEnd(user.region_name, formatTimeKyiv(new Date(start)), formatTimeKyiv(new Date(now)), duration) : m.clear(user.region_name);
+    // "now" is only a good stand-in for the real end time if we were polling
+    // recently; if there's a wide gap since the last successful poll (outage,
+    // maintenance, rate limiting), "now" can be arbitrarily later than the
+    // actual clear, so don't claim a precise end time/duration in that case.
+    const detectionGap = lastCheckedAt ? now - lastCheckedAt : Infinity;
+    const uncertain = detectionGap > DETECTION_GAP_MS;
+    if (uncertain) {
+      text = m.clearApprox
+        ? m.clearApprox(user.region_name, start ? formatTimeKyiv(new Date(start)) : null, formatTimeKyiv(new Date(now)))
+        : m.clear(user.region_name);
+    } else {
+      // Duration is derived from the same minute-truncated timestamps shown to
+      // the user (formatTimeKyiv drops seconds), so the printed start/end and
+      // the printed duration always agree instead of disagreeing by up to a minute.
+      const startMinuteMs = start ? Math.floor(new Date(start).getTime() / 60000) * 60000 : null;
+      const nowMinuteMs = Math.floor(now / 60000) * 60000;
+      const duration = startMinuteMs !== null ? formatDuration(nowMinuteMs - startMinuteMs, user.lang) : null;
+      text = duration ? m.clearEnd(user.region_name, formatTimeKyiv(new Date(start)), formatTimeKyiv(new Date(now)), duration) : m.clear(user.region_name);
+    }
   } else {
     text = stateMessage(user.region_name, newStatus, user.lang);
   }
@@ -721,7 +744,7 @@ async function deliverChange(env, job, now) {
   return true;
 }
 
-async function notifyUsers(env, previousData, data, now) {
+async function notifyUsers(env, previousData, data, now, lastCheckedAt) {
   const jobs = [];
   let cursor;
   do {
@@ -742,7 +765,7 @@ async function notifyUsers(env, previousData, data, now) {
   let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
     const results = await Promise.all(jobs.slice(i, i + SEND_CONCURRENCY).map(job =>
-      deliverChange(env, job, now).catch(e => { console.error("[notify] deliver error:", e); return false; })
+      deliverChange(env, job, now, lastCheckedAt).catch(e => { console.error("[notify] deliver error:", e); return false; })
     ));
     if (results.some(ok => !ok)) hadFailures = true;
   }
@@ -769,6 +792,7 @@ const TEXTS = {
     yellow: (region, time) => `🟡 <b>Жовтий рівень загрози</b>\n${region} • ${time}`,
     red: (region, time) => `🔴 <b>Червоний рівень загрози</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>Тривоги немає</b>\n${region} • ${start}–${end} • ${duration}`,
+    clearApprox: (region, start, detectedAt) => `🟢 <b>Тривоги більше немає</b>\n${region}${start ? ` • почалась ${start}` : ""}\nТочний час відбою невідомий через перерву в роботі сервісу (зафіксовано о ${detectedAt})`,
     enabled: "✅ Сповіщення через Telegram увімкнено",
     unsubscribed: "❌ Сповіщення через Telegram вимкнено",
     test: "⚪ Це тестове повідомлення від Air Raid Alert.",
@@ -785,6 +809,7 @@ const TEXTS = {
     yellow: (region, time) => `🟡 <b>Жёлтый уровень угрозы</b>\n${region} • ${time}`,
     red: (region, time) => `🔴 <b>Красный уровень угрозы</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>Тревоги нет</b>\n${region} • ${start}–${end} • ${duration}`,
+    clearApprox: (region, start, detectedAt) => `🟢 <b>Тревоги больше нет</b>\n${region}${start ? ` • началась ${start}` : ""}\nТочное время отбоя неизвестно из-за перерыва в работе сервиса (зафиксировано в ${detectedAt})`,
     enabled: "✅ Уведомления через Telegram включены",
     unsubscribed: "❌ Уведомления через Telegram отключены",
     test: "⚪ Это тестовое сообщение от Air Raid Alert.",
@@ -801,6 +826,7 @@ const TEXTS = {
     yellow: (region, time) => `🟡 <b>Yellow threat level</b>\n${region} • ${time}`,
     red: (region, time) => `🔴 <b>Red threat level</b>\n${region} • ${time}`,
     clearEnd: (region, start, end, duration) => `🟢 <b>All clear</b>\n${region} • ${start}–${end} • ${duration}`,
+    clearApprox: (region, start, detectedAt) => `🟢 <b>All clear</b>\n${region}${start ? ` • started ${start}` : ""}\nExact end time unknown due to a service interruption (detected at ${detectedAt})`,
     enabled: "✅ Telegram notifications enabled",
     unsubscribed: "❌ Telegram notifications disabled",
     test: "⚪ This is a test message from Air Raid Alert.",
