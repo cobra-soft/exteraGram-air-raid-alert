@@ -722,17 +722,22 @@ async function deliverChange(env, job, now) {
 }
 
 async function notifyUsers(env, previousData, data, now) {
-  const users = await listAllUsers(env);
   const jobs = [];
-  for (const user of users) {
-    if (!user || !user.chat_id || !user.oblast_key) continue;
-    if (user.notify === false) continue;
-    const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-    const knownState = user.last_alert_state || "clear";
-    if (knownState === newStatus.state) continue;
-    const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
-    jobs.push({ key: `user:${user.chat_id}`, user, oldStatus, newStatus });
-  }
+  let cursor;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const item of page.keys || []) {
+      const user = item.metadata || await readUser(env, item.name);
+      if (!user || !user.chat_id || !user.oblast_key) continue;
+      if (user.notify === false) continue;
+      const newStatus = alertStatus(data, user.oblast_key, user.district_key);
+      const knownState = user.last_alert_state || "clear";
+      if (knownState === newStatus.state) continue;
+      const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
+      jobs.push({ key: item.name, user, oldStatus, newStatus });
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
 
   let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
@@ -851,152 +856,35 @@ async function sendTelegramTracked(env, chatId, text) {
   return await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
 }
 
-// Users now live in D1 (table `users`), not KV. `device:` link tokens
-// (short-lived, used only during /start linking) stay in KV — low volume,
-// well within the free quota. `key` keeps the historical "user:<chat_id>"
-// shape so call sites didn't need to change.
-function chatIdFromKey(key) {
-  return String(key).replace(/^user:/, "");
-}
-
-function rowToUser(row) {
-  if (!row) return null;
-  return {
-    chat_id: row.chat_id,
-    sync_token: row.sync_token || undefined,
-    oblast_key: row.oblast_key || null,
-    district_key: row.district_key || null,
-    region_name: row.region_name || null,
-    lang: row.lang || null,
-    notify: row.notify !== 0,
-    last_activity: row.last_activity || null,
-    telegram_connected: row.telegram_connected !== 0,
-    telegram_username: row.telegram_username || null,
-    telegram_first_name: row.telegram_first_name || null,
-    telegram_last_name: row.telegram_last_name || null,
-    registered_at: row.registered_at || null,
-    last_check: row.last_check || null,
-    last_alert_state: row.last_alert_state || "clear",
-    last_alert_active: !!row.last_alert_active,
-    last_alert_start: row.last_alert_start || null,
-    last_alert_end: row.last_alert_end || null
-  };
-}
-
 async function readUser(env, key) {
-  const chatId = chatIdFromKey(key);
   try {
-    const row = await env.DB.prepare("SELECT * FROM users WHERE chat_id = ?1").bind(chatId).first();
-    return rowToUser(row);
+    const result = await env.USERS.getWithMetadata(key);
+    if (!result) return null;
+
+    let userData = result.metadata;
+    if (typeof userData === "string") {
+      try {
+        userData = JSON.parse(userData);
+      } catch (parseErr) {
+        console.error(`[user] failed to parse metadata for ${key}:`, parseErr);
+        return null;
+      }
+    }
+
+    if (userData && typeof userData === "object") return userData;
   } catch (e) {
-    console.error(`[user] d1 read error for ${chatId}:`, e);
-    return null;
+    console.error(`[user] read error for ${key}:`, e);
   }
+  return null;
 }
 
 async function writeUser(env, key, user) {
-  const chatId = chatIdFromKey(key);
-  const u = user || {};
   try {
-    await env.DB.prepare(`
-      INSERT INTO users (
-        chat_id, sync_token, oblast_key, district_key, region_name, lang, notify,
-        last_activity, telegram_connected, telegram_username, telegram_first_name, telegram_last_name,
-        registered_at, last_check, last_alert_state, last_alert_active, last_alert_start, last_alert_end, updated_at
-      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
-      ON CONFLICT(chat_id) DO UPDATE SET
-        sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key,
-        region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify,
-        last_activity=excluded.last_activity, telegram_connected=excluded.telegram_connected,
-        telegram_username=excluded.telegram_username, telegram_first_name=excluded.telegram_first_name,
-        telegram_last_name=excluded.telegram_last_name, registered_at=excluded.registered_at,
-        last_check=excluded.last_check, last_alert_state=excluded.last_alert_state,
-        last_alert_active=excluded.last_alert_active, last_alert_start=excluded.last_alert_start,
-        last_alert_end=excluded.last_alert_end, updated_at=excluded.updated_at
-    `).bind(
-      chatId,
-      u.sync_token || null,
-      u.oblast_key || null,
-      u.district_key || null,
-      u.region_name || null,
-      u.lang || null,
-      u.notify === false ? 0 : 1,
-      u.last_activity || null,
-      u.telegram_connected === false ? 0 : 1,
-      u.telegram_username || null,
-      u.telegram_first_name || null,
-      u.telegram_last_name || null,
-      u.registered_at || null,
-      u.last_check || null,
-      u.last_alert_state || "clear",
-      u.last_alert_active ? 1 : 0,
-      u.last_alert_start || null,
-      u.last_alert_end || null,
-      Date.now()
-    ).run();
+    await env.USERS.put(key, "", { metadata: user });
   } catch (e) {
-    console.error(`[user] d1 write error for ${chatId}:`, e);
+    console.error(`[user] write error for ${key}:`, e);
     throw e;
   }
-}
-
-async function deleteUser(env, key) {
-  const chatId = chatIdFromKey(key);
-  try {
-    await env.DB.prepare("DELETE FROM users WHERE chat_id = ?1").bind(chatId).run();
-  } catch (e) {
-    console.error(`[user] d1 delete error for ${chatId}:`, e);
-  }
-}
-
-async function listAllUsers(env) {
-  try {
-    const { results } = await env.DB.prepare("SELECT * FROM users").all();
-    return (results || []).map(rowToUser);
-  } catch (e) {
-    console.error("[user] d1 list error:", e);
-    return [];
-  }
-}
-
-// One-off migration: copies every `user:*` record still sitting in the old
-// KV metadata store into the new D1 `users` table. Safe to run more than
-// once (writeUser is an upsert), so it can be re-run if it ever gets cut
-// off partway through (e.g. timed out on a very large user base).
-async function migrateKvUsersToD1(env) {
-  let migrated = 0, skipped = 0, cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const user = item.metadata;
-      if (!user || !user.chat_id) { skipped++; continue; }
-      try {
-        await writeUser(env, item.name, user);
-        migrated++;
-      } catch (e) {
-        console.error(`[migrate] failed for ${item.name}:`, e);
-        skipped++;
-      }
-    }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
-  return { migrated, skipped };
-}
-
-// Deletes the old `user:*` KV records once you've confirmed the D1
-// migration looks correct. Not required for the worker to function
-// (they're simply unused after migration), just housekeeping.
-async function purgeKvUsers(env) {
-  let deleted = 0, cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      await env.USERS.delete(item.name);
-      deleted++;
-    }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
-  return { deleted };
 }
 
 async function randomToken() {
@@ -1250,19 +1138,25 @@ function adminJson(body, status = 200) {
 
 async function collectUsers(env, data) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
-  const users = await listAllUsers(env);
-  for (const u of users) {
-    if (!u) continue;
-    st.total++;
-    if (u.notify === false) st.notifyOff++;
-    if (!u.oblast_key) { st.noRegion++; continue; }
-    const lang = normLang(u.lang);
-    st.byLang[lang] = (st.byLang[lang] || 0) + 1;
-    const known = u.last_alert_state || "clear";
-    st.byState[known] = (st.byState[known] || 0) + 1;
-    st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
-    if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
-  }
+  let cursor, pages = 0;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const it of page.keys || []) {
+      const u = it.metadata;
+      if (!u) continue;
+      st.total++;
+      if (u.notify === false) st.notifyOff++;
+      if (!u.oblast_key) { st.noRegion++; continue; }
+      const lang = normLang(u.lang);
+      st.byLang[lang] = (st.byLang[lang] || 0) + 1;
+      const known = u.last_alert_state || "clear";
+      st.byState[known] = (st.byState[known] || 0) + 1;
+      st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
+      if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
+    }
+    cursor = page.list_complete ? null : page.cursor;
+    if (cursor && ++pages >= 10) { st.truncated = true; break; }
+  } while (cursor);
   st.byOblast = Object.entries(st.byOblast).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => ({ key: k, name: OBLAST_NAMES_UK[k] || k, n }));
   return st;
 }
@@ -1341,14 +1235,6 @@ async function handleAdmin(request, env, url) {
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
       return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
-    }
-    if (name === "migrate-kv-users") {
-      try { return adminJson({ ok: true, ...(await migrateKvUsersToD1(env)) }); }
-      catch (e) { return adminJson({ ok: false, error: String(e) }, 500); }
-    }
-    if (name === "purge-kv-users") {
-      try { return adminJson({ ok: true, ...(await purgeKvUsers(env)) }); }
-      catch (e) { return adminJson({ ok: false, error: String(e) }, 500); }
     }
     return adminJson({ error: "unknown action" }, 400);
   }
@@ -1530,7 +1416,6 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
  o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
- o+=card("Миграция KV → D1",'<div class="row"><button class="btn f" onclick="ask(\\'migrate-kv-users\\',\\'Перенести юзеров из KV в D1?\\',\\'Скопирует все записи user:* из KV в таблицу users в D1. Можно запускать повторно — безопасно (upsert).\\')">Мигрировать юзеров</button><button class="btn o" onclick="ask(\\'purge-kv-users\\',\\'Удалить старые записи из KV?\\',\\'Необратимо удалит все user:* ключи в KV. Делай это только после того, как проверил(а), что все юзеры есть в D1 (вкладка «Юзеры»).\\')">Очистить KV (после проверки)</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
@@ -1770,7 +1655,7 @@ export default {
           return json({ error: "invalid sync token" }, 403);
         }
 
-        await deleteUser(env, `user:${chat_id}`);
+        await env.USERS.delete(`user:${chat_id}`);
         await sendTelegramTracked(env, chat_id, M(existing.lang).unsubscribed);
 
         return json({ ok: true, existed: true });
