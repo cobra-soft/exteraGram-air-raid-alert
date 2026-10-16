@@ -483,6 +483,65 @@ async function fetchUpstreamRetry(env) {
   }
 }
 
+const CRON_HEARTBEAT_KEY = "cron-heartbeat";
+async function getLastHeartbeat(env) {
+  const raw = await d1GetKV(env.DB, CRON_HEARTBEAT_KEY);
+  const n = raw ? Number(raw) : 0;
+  return Number.isFinite(n) ? n : 0;
+}
+async function setHeartbeat(env, ts) {
+  await d1PutKV(env.DB, CRON_HEARTBEAT_KEY, String(ts));
+}
+
+const MAINTENANCE_KEY = "maintenance-mode";
+async function getMaintenance(env) {
+  try {
+    const raw = await d1GetKV(env.DB, MAINTENANCE_KEY);
+    if (!raw) return { on: false, since: null };
+    const v = JSON.parse(raw);
+    return { on: !!(v && v.on), since: (v && v.since) || null };
+  } catch (e) {
+    return { on: false, since: null };
+  }
+}
+async function setMaintenance(env, on) {
+  const value = { on: !!on, since: Date.now() };
+  await d1PutKV(env.DB, MAINTENANCE_KEY, JSON.stringify(value));
+  return value;
+}
+
+async function broadcastToUsers(env, textFn) {
+  const jobs = [];
+  let cursor;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const item of page.keys || []) {
+      const user = item.metadata || await readUser(env, item.name);
+      if (!user || !user.chat_id) continue;
+      if (user.notify === false) continue;
+      jobs.push(user);
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+
+  let sent = 0, failed = 0;
+  for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
+    const results = await Promise.all(jobs.slice(i, i + SEND_CONCURRENCY).map(async user => {
+      try {
+        const text = textFn(user);
+        const res = await sendTelegramTracked(env, user.chat_id, text);
+        return !!res.ok;
+      } catch (e) {
+        console.error("[maintenance] broadcast send error:", e);
+        return false;
+      }
+    }));
+    sent += results.filter(Boolean).length;
+    failed += results.filter(ok => !ok).length;
+  }
+  return { total: jobs.length, sent, failed };
+}
+
 const CRON_STATUS_KEY = "cron-status";
 async function recordCron(env, ok, err) {
   try {
@@ -650,7 +709,11 @@ function stateMessage(region, status, lang) {
 }
 
 async function checkAllUsers(env) {
+  const maintenance = await getMaintenance(env);
+  if (maintenance.on) return;
+
   const previous = await readCache(env.DB);
+  const prevHeartbeat = await getLastHeartbeat(env);
   let data;
   try {
     data = await fetchUpstreamRetry(env);
@@ -661,6 +724,7 @@ async function checkAllUsers(env) {
   }
   await recordCron(env, true);
   const now = Date.now();
+  await setHeartbeat(env, now);
   const signature = buildStatusSignature(data);
 
   if (!previous) {
@@ -680,7 +744,7 @@ async function checkAllUsers(env) {
   }
 
   if (changed || needsRetryPass) {
-    const hadFailures = await notifyUsers(env, previous.data, data, now, lastWriteAt);
+    const hadFailures = await notifyUsers(env, previous.data, data, now, prevHeartbeat);
     const retryAfter = hadFailures ? (retryBefore || now) : 0;
     if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
       await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
@@ -792,6 +856,8 @@ const TEXTS = {
     test: "⚪ Це тестове повідомлення від Air Raid Alert.",
     statusNoRegion: "⚪ Регіон ще не обрано.\nВідкрий налаштування плагіна Air Raid Alert і обери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    maintenanceOn: "🛠 Сервер на тех.роботах, будь ласка, зачекай.\nСповіщення тимчасово призупинені.",
+    maintenanceOff: "✅ Тех.роботи завершено, сповіщення відновлено.",
     units: { h: "год", m: "хв" }
   },
   ru: {
@@ -809,6 +875,8 @@ const TEXTS = {
     test: "⚪ Это тестовое сообщение от Air Raid Alert.",
     statusNoRegion: "⚪ Регион ещё не выбран.\nОткрой настройки плагина Air Raid Alert и выбери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    maintenanceOn: "🛠 Сервер на тех.работах, пожалуйста, подожди.\nУведомления временно приостановлены.",
+    maintenanceOff: "✅ Тех.работы завершены, уведомления восстановлены.",
     units: { h: "ч", m: "мин" }
   },
   en: {
@@ -826,6 +894,8 @@ const TEXTS = {
     test: "⚪ This is a test message from Air Raid Alert.",
     statusNoRegion: "⚪ No region selected yet.\nOpen the Air Raid Alert plugin settings and choose an oblast.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    maintenanceOn: "🛠 The server is under maintenance, please wait.\nNotifications are temporarily paused.",
+    maintenanceOff: "✅ Maintenance finished, notifications are back.",
     units: { h: "h", m: "min" }
   }
 };
@@ -1016,7 +1086,10 @@ async function handleTelegramWebhookInner(request, env) {
     const user = await readUser(env, `user:${chatId}`);
     const lang = normLang((user && user.lang) || (message.from && message.from.language_code));
     const m = M(lang);
-    if (!user || !user.oblast_key) {
+    const maintenance = await getMaintenance(env);
+    if (maintenance.on) {
+      await sendTelegramTracked(env, chatId, m.maintenanceOn);
+    } else if (!user || !user.oblast_key) {
       await sendTelegramTracked(env, chatId, m.statusNoRegion);
     } else {
       try {
@@ -1190,6 +1263,7 @@ async function adminData(env, request, full, kvTest, probeUp) {
   };
   const c = await readCache(env.DB);
   try { const cronRaw = await d1GetKV(env.DB, CRON_STATUS_KEY); out.cron = cronRaw ? JSON.parse(cronRaw) : null; } catch (e) { out.cron = null; }
+  out.maintenance = await getMaintenance(env);
   out.snapshot = c ? {
     fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
     pendingRetry: c.pendingRetry || 0, signature: c.signature,
@@ -1255,6 +1329,13 @@ async function handleAdmin(request, env, url) {
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
       return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
+    }
+    if (name === "toggle-maintenance") {
+      const cur = await getMaintenance(env);
+      const next = !cur.on;
+      const state = await setMaintenance(env, next);
+      const result = await broadcastToUsers(env, user => M(user.lang)[next ? "maintenanceOn" : "maintenanceOff"]);
+      return adminJson({ ok: true, on: state.on, since: state.since, ...result });
     }
     return adminJson({ error: "unknown action" }, 400);
   }
@@ -1352,6 +1433,7 @@ var IC={ov:"M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z",al:"M
 var TABS=[["ov","Обзор"],["al","Тревоги"],["us","Юзеры"],["sy","Система"]];
 function $(i){return document.getElementById(i)}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function q1(s){return "'"+String(s==null?"":s).replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/\n/g,"\\n")+"'"}
 function tm(x){return x?new Date(x).toLocaleTimeString("ru-RU",{timeZone:TZ,hour:"2-digit",minute:"2-digit"}):"—"}
 function dtm(x){return x?new Date(x).toLocaleString("ru-RU",{timeZone:TZ}):"—"}
 function age(s){if(s==null)return"—";if(s<90)return s+" с";if(s<5400)return Math.round(s/60)+" мин";return(s/3600).toFixed(1)+" ч"}
@@ -1375,7 +1457,9 @@ function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  return{lvl:lvl,is:is}}
 function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.raions.length:0;
  var T={ok:["✓","Всё работает","Критических проблем не обнаружено"],warn:["!","Есть замечания",""],bad:["✕","Есть проблемы",""]}[h.lvl];
- var o='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
+ var o="";
+ if(d.maintenance&&d.maintenance.on){o+='<div class="hero card warn"><div class="ic">🛠</div><div><b>Тех.работы включены</b><span>Уведомления пользователям приостановлены · с '+dtm(d.maintenance.since)+'</span></div></div>'}
+ o+='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
  o+='<div class="metrics"><div class="m'+(n?' hl':'')+'"><div class="v">'+n+'</div><div class="l">Активных тревог</div></div>'
   +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.total:"—")+'</div><div class="l">Пользователей</div></div>'
@@ -1434,8 +1518,11 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Состояние (last_alert_state)",bars(t.byState,tot));
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
-function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
+function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",mOn=d.maintenance&&d.maintenance.on;
+ var mTitle=mOn?"Выключить тех.работы?":"Включить тех.работы?";
+ var mText=mOn?"Пользователям разошлётся сообщение, что сервис снова работает. Cron возобновит проверки и уведомления.":"Всем подписанным пользователям сразу разошлётся сообщение о тех.работах. Cron перестанет опрашивать alerts.in.ua и слать уведомления до выключения.";
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\'purge-edge\',\'Сбросить кэш /api?\',\'Следующий запрос плагина пойдёт в D1/upstream.\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\'setup-webhook\',\'Установить webhook?\',\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\')">Setup webhook</button>'
+  +'<button class="btn'+(mOn?"":" o")+'" onclick="ask(\'toggle-maintenance\','+q1(mTitle)+','+q1(mText)+')">'+(mOn?"🛠 Выключить тех.работы":"🛠 Включить тех.работы")+'</button></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
