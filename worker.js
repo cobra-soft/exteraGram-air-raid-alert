@@ -41,6 +41,7 @@ const KYIV_TZ = "Europe/Kyiv";
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Cache-Control": "no-store"
 };
 
@@ -1189,6 +1190,53 @@ function adminJson(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
+function sqlEscape(v) {
+  if (v === null || v === undefined || v === "") return "NULL";
+  return "'" + String(v).replace(/'/g, "''") + "'";
+}
+
+async function buildUsersExportSQL(env, overwrite) {
+  const conflict = overwrite
+    ? "DO UPDATE SET sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key, region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify, telegram_connected=excluded.telegram_connected, registered_at=excluded.registered_at, last_activity=excluded.last_activity, last_check=excluded.last_check, last_alert_state=excluded.last_alert_state, last_alert_active=excluded.last_alert_active, last_alert_start=excluded.last_alert_start, last_alert_end=excluded.last_alert_end, raw=excluded.raw"
+    : "DO NOTHING";
+  const cols = "chat_id, sync_token, oblast_key, district_key, region_name, lang, notify, telegram_connected, registered_at, last_activity, last_check, last_alert_state, last_alert_active, last_alert_start, last_alert_end, raw";
+  const lines = ["BEGIN TRANSACTION;"];
+  let cursor, count = 0, guard = 0;
+  do {
+    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const item of page.keys || []) {
+      const u = item.metadata;
+      if (!u || typeof u !== "object") continue;
+      const chat = String(item.name).slice(5);
+      if (!/^-?\d+$/.test(chat)) continue;
+      const vals = [
+        sqlEscape(chat),
+        sqlEscape(u.sync_token),
+        sqlEscape(u.oblast_key),
+        sqlEscape(u.district_key),
+        sqlEscape(u.region_name),
+        sqlEscape(u.lang),
+        u.notify === false ? "0" : "1",
+        u.telegram_connected ? "1" : "0",
+        sqlEscape(u.registered_at),
+        sqlEscape(u.last_activity),
+        sqlEscape(u.last_check),
+        sqlEscape(u.last_alert_state),
+        u.last_alert_active ? "1" : (u.last_alert_active === false ? "0" : "NULL"),
+        sqlEscape(u.last_alert_start),
+        sqlEscape(u.last_alert_end),
+        sqlEscape(JSON.stringify(u))
+      ];
+      lines.push(`INSERT INTO users (${cols}) VALUES (${vals.join(", ")}) ON CONFLICT(chat_id) ${conflict};`);
+      count++;
+    }
+    cursor = page.list_complete ? null : page.cursor;
+    if (cursor && ++guard >= 100) break;
+  } while (cursor);
+  lines.push("COMMIT;");
+  return { sql: lines.join("\n"), count };
+}
+
 async function collectUsers(env, data) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
   let cursor, pages = 0;
@@ -1263,6 +1311,26 @@ async function handleAdmin(request, env, url) {
     } });
   }
 
+  if (p === "/admin/export/users.sql" && request.method === "POST") {
+    let pw = "";
+    try {
+      const ct = request.headers.get("Content-Type") || "";
+      if (ct.includes("application/json")) pw = (await request.json()).password;
+      else pw = (await request.formData()).get("password");
+    } catch (e) { }
+    if (!safeEqual(String(pw || "").trim(), String(env.ADMIN_TOKEN).trim())) {
+      return adminJson({ error: "invalid admin token" }, 401);
+    }
+    const { sql, count } = await buildUsersExportSQL(env, url.searchParams.get("overwrite") === "1");
+    console.log(`[admin] users.sql export (POST): ${count} rows`);
+    return new Response(sql, { headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="users.sql"',
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+      "X-Robots-Tag": "noindex"
+    } });
+  }
   if (!(await isAdmin(request, env))) {
     if (p === "/admin") return loginPage("");
     return new Response("Unauthorized", { status: 401 });
@@ -1281,6 +1349,17 @@ async function handleAdmin(request, env, url) {
   if (p === "/admin/data") {
     try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1", url.searchParams.get("up") === "1")); }
     catch (e) { return adminJson({ error: String(e) }, 500); }
+  }
+  if (p === "/admin/export/users.sql") {
+    const { sql, count } = await buildUsersExportSQL(env, url.searchParams.get("overwrite") === "1");
+    console.log(`[admin] users.sql export: ${count} rows`);
+    return new Response(sql, { headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Disposition": 'attachment; filename="users.sql"',
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+      "X-Robots-Tag": "noindex"
+    } });
   }
   if (p === "/admin/action" && request.method === "POST") {
     const name = url.searchParams.get("name");
@@ -1468,7 +1547,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
