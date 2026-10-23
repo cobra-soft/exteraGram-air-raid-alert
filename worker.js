@@ -1200,7 +1200,8 @@ async function buildUsersExportSQL(env, overwrite) {
     ? "DO UPDATE SET sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key, region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify, telegram_connected=excluded.telegram_connected, registered_at=excluded.registered_at, last_activity=excluded.last_activity, last_check=excluded.last_check, last_alert_state=excluded.last_alert_state, last_alert_active=excluded.last_alert_active, last_alert_start=excluded.last_alert_start, last_alert_end=excluded.last_alert_end, raw=excluded.raw"
     : "DO NOTHING";
   const cols = "chat_id, sync_token, oblast_key, district_key, region_name, lang, notify, telegram_connected, registered_at, last_activity, last_check, last_alert_state, last_alert_active, last_alert_start, last_alert_end, raw";
-  const lines = ["BEGIN TRANSACTION;"];
+  // D1 не поддерживает явные BEGIN/COMMIT: каждый запрос автокоммитится.
+  const lines = [];
   let cursor, count = 0, guard = 0;
   do {
     const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
@@ -1233,7 +1234,6 @@ async function buildUsersExportSQL(env, overwrite) {
     cursor = page.list_complete ? null : page.cursor;
     if (cursor && ++guard >= 100) break;
   } while (cursor);
-  lines.push("COMMIT;");
   return { sql: lines.join("\n"), count };
 }
 
