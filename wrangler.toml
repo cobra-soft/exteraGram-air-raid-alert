@@ -3,6 +3,10 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 keep_vars = true
 
+# keep_vars = true обязателен при деплое из GitHub:
+# без него wrangler может затереть переменные и секреты, заданные в Dashboard
+# (BOT_TOKEN, ALERTS_API_KEY, ADMIN_TOKEN).
+
 kv_namespaces = [
   { binding = "USERS", id = "23d60800f794435b8596c28c62de177c" }
 ]

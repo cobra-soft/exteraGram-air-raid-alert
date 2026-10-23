@@ -221,3 +221,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Changelog
+
+### 2026-10-23 — security patch
+- `/setup-webhook` and `/webhook-info` are no longer reachable without a configured `ADMIN_TOKEN`.
+- A Telegram `/start <deviceId>` can no longer overwrite an existing device binding that belongs to another chat.
+- Region names are HTML-escaped before being sent to Telegram; oversized KV metadata is trimmed.
+- Permanent Telegram delivery errors no longer freeze a user's alert state.
+
+See `SECURITY-PATCH.md` for details and `MIGRATION.md` for moving users from KV to D1 without Node.js.
