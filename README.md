@@ -23,19 +23,10 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 
 ### Setup (Cloudflare dashboard only)
 1. **Create the storage.**
-   - Storage & Databases → KV → *Create instance*, name it `USERS`.
    - Storage & Databases → D1 SQL Database → *Create database*, name it `air-raid-cache`.
-2. **Create the tables.** Open the D1 database → *Console* and run:
-   ```sql
-   CREATE TABLE cache_kv (
-     key TEXT PRIMARY KEY,
-     value TEXT,
-     updated_at INTEGER
-   );
-   ```
+2. **Create the tables.** Open the D1 database → *Console* and run the contents of `d1_full_schema.sql` (creates `users`, `cache_kv`, `notified_events`, `device_links`). This is a one-time step — Cloudflare keeps the tables after this.
 3. **Create the Worker.** Workers & Pages → *Create* → *Worker* → give it a name → *Edit code*, replace the default code with the contents of `worker.js`, then *Deploy*.
 4. **Add bindings.** Open the Worker → *Settings* → *Bindings* → *Add*:
-   - KV namespace: variable name `USERS`, namespace `USERS`.
    - D1 database: variable name `DB`, database `air-raid-cache`.
 5. **Add secrets.** Worker → *Settings* → *Variables and Secrets* → add as **Secret** type:
    - `BOT_TOKEN` — your Telegram bot token.
@@ -49,8 +40,32 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 ### Bindings
 | Binding | Type | Purpose |
 |---|---|---|
-| `USERS` | KV | User records, device-link tokens |
-| `DB` | D1 | Alert snapshot cache, cron status |
+| `DB` | D1 | Everything the Worker stores: user records, device-link tokens, alert snapshot cache, cron status |
+
+All persistent storage lives in this single D1 database. There is no KV namespace — an earlier version used KV for user records, but the project has fully migrated to D1 (see `MIGRATION.md`).
+
+### What's stored and where
+The `users` table in D1 is the only place per-user ("account") data lives. For each Telegram chat that registers, it holds:
+- the Telegram `chat_id`;
+- the selected oblast/district keys and the resolved region name;
+- language, notification on/off, and whether the chat is Telegram-connected;
+- a `sync_token` used to authenticate requests from the plugin;
+- timestamps: `registered_at`, `last_activity`, `last_check`;
+- the user's last known alert state for their region (`last_alert_state`, `last_alert_active`, `last_alert_start`, `last_alert_end`);
+- a `raw` column that duplicates all of the above as a single JSON blob (kept for forward-compatible fields; it is not additional data beyond what's listed).
+
+No message text, phone numbers, Telegram usernames, or precise GPS location are collected — only the chosen oblast/district and a Telegram chat ID.
+
+Other D1 tables:
+- `device_links` — a short-lived (minutes), self-expiring mapping used only to link a plugin install to a Telegram chat during the `/start` flow; rows are deleted once used or after they expire.
+- `cache_kv` — not user data: the shared snapshot of the current alert status, cron health, and a maintenance flag, fetched from alerts.in.ua.
+- `notified_events` — dedupe keys (not personal data) used to avoid sending the same notification twice.
+
+The `/admin` dashboard (password-protected with `ADMIN_TOKEN`) can export the full `users` table as a SQL dump for backup/migration purposes; treat `ADMIN_TOKEN` accordingly.
+
+For failed `/admin` login attempts, the Worker briefly keeps the requester's IP (via Cloudflare's edge cache, not D1) to rate-limit retries; this is not linked to any Telegram user or stored long-term.
+
+The Worker does not send user data to any third party other than Telegram (to deliver notifications) and alerts.in.ua (to read the public, non-personal alert status).
 
 ### Endpoints
 | Method | Path | Description |
@@ -87,20 +102,11 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 Локальные инструменты не нужны. Всё настраивается в панели Cloudflare, код работает на среде выполнения Cloudflare.
 
 ### Установка (только панель Cloudflare)
-1. **Создайте хранилища.**
-   - Storage & Databases → KV → *Create instance*, назовите `USERS`.
+1. **Создайте хранилище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назовите `air-raid-cache`.
-2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните:
-   ```sql
-   CREATE TABLE cache_kv (
-     key TEXT PRIMARY KEY,
-     value TEXT,
-     updated_at INTEGER
-   );
-   ```
+2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните содержимое `d1_full_schema.sql` (создаёт `users`, `cache_kv`, `notified_events`, `device_links`). Это разовое действие — Cloudflare сохранит таблицы после него.
 3. **Создайте Worker.** Workers & Pages → *Create* → *Worker* → укажите имя → *Edit code*, замените код по умолчанию содержимым `worker.js`, затем *Deploy*.
 4. **Добавьте биндинги.** Откройте Worker → *Settings* → *Bindings* → *Add*:
-   - KV namespace: имя переменной `USERS`, namespace `USERS`.
    - D1 database: имя переменной `DB`, база `air-raid-cache`.
 5. **Добавьте секреты.** Worker → *Settings* → *Variables and Secrets* → добавьте с типом **Secret**:
    - `BOT_TOKEN` — токен вашего Telegram-бота.
@@ -114,8 +120,32 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 ### Биндинги
 | Биндинг | Тип | Назначение |
 |---|---|---|
-| `USERS` | KV | Записи пользователей, токены привязки устройств |
-| `DB` | D1 | Кэш снимка тревог, статус cron |
+| `DB` | D1 | Всё, что хранит Worker: записи пользователей, токены привязки устройств, кэш снимка тревог, статус cron |
+
+Всё постоянное хранилище — это одна база D1. Отдельного KV namespace нет: раньше записи пользователей хранились в KV, но проект полностью перешёл на D1 (см. `MIGRATION.md`).
+
+### Что и где хранится
+Таблица `users` в D1 — единственное место, где хранятся данные конкретного пользователя (аккаунта). Для каждого зарегистрированного Telegram-чата там хранится:
+- `chat_id` в Telegram;
+- выбранные ключи области/района и итоговое название региона;
+- язык, включены ли уведомления, и подключён ли чат к Telegram;
+- `sync_token` — токен для аутентификации запросов от плагина;
+- временные метки: `registered_at`, `last_activity`, `last_check`;
+- последний известный статус тревоги для региона пользователя (`last_alert_state`, `last_alert_active`, `last_alert_start`, `last_alert_end`);
+- колонка `raw` — дублирует все перечисленные поля одним JSON-объектом (для совместимости со старым форматом; это не дополнительные данные сверх перечисленного).
+
+Текст сообщений, номера телефонов, юзернеймы Telegram или точная GPS-локация не собираются — только выбранная область/район и chat_id в Telegram.
+
+Остальные таблицы D1:
+- `device_links` — короткоживущая (минуты), самоудаляющаяся связка для привязки установки плагина к Telegram-чату во время сценария `/start`; строки удаляются после использования или по истечении срока.
+- `cache_kv` — не пользовательские данные: общий снимок текущего статуса тревог, состояние cron и флаг техработ, полученные из alerts.in.ua.
+- `notified_events` — ключи дедупликации (не персональные данные), чтобы не отправлять одно и то же уведомление дважды.
+
+Панель `/admin` (защищена паролем `ADMIN_TOKEN`) умеет экспортировать всю таблицу `users` в виде SQL-дампа для бэкапа/переноса — относитесь к `ADMIN_TOKEN` соответственно.
+
+При неудачных попытках входа в `/admin` Worker кратковременно хранит IP-адрес запроса (в edge-кэше Cloudflare, не в D1) для ограничения частоты попыток; это не связано ни с одним Telegram-пользователем и не хранится долго.
+
+Worker не передаёт пользовательские данные никому, кроме Telegram (для доставки уведомлений) и alerts.in.ua (для чтения публичного, обезличенного статуса тревог).
 
 ### Эндпоинты
 | Метод | Путь | Описание |
@@ -152,20 +182,11 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 Локальні інструменти не потрібні. Усе налаштовується в панелі Cloudflare, код працює на середовищі виконання Cloudflare.
 
 ### Встановлення (лише панель Cloudflare)
-1. **Створіть сховища.**
-   - Storage & Databases → KV → *Create instance*, назвіть `USERS`.
+1. **Створіть сховище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назвіть `air-raid-cache`.
-2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте:
-   ```sql
-   CREATE TABLE cache_kv (
-     key TEXT PRIMARY KEY,
-     value TEXT,
-     updated_at INTEGER
-   );
-   ```
+2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте вміст `d1_full_schema.sql` (створює `users`, `cache_kv`, `notified_events`, `device_links`). Це одноразова дія — Cloudflare збереже таблиці після неї.
 3. **Створіть Worker.** Workers & Pages → *Create* → *Worker* → вкажіть назву → *Edit code*, замініть код за замовчуванням вмістом `worker.js`, потім *Deploy*.
 4. **Додайте біндинги.** Відкрийте Worker → *Settings* → *Bindings* → *Add*:
-   - KV namespace: назва змінної `USERS`, namespace `USERS`.
    - D1 database: назва змінної `DB`, база `air-raid-cache`.
 5. **Додайте секрети.** Worker → *Settings* → *Variables and Secrets* → додайте з типом **Secret**:
    - `BOT_TOKEN` — токен вашого Telegram-бота.
@@ -179,8 +200,32 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 ### Біндинги
 | Біндинг | Тип | Призначення |
 |---|---|---|
-| `USERS` | KV | Записи користувачів, токени прив'язки пристроїв |
-| `DB` | D1 | Кеш снімка тривог, статус cron |
+| `DB` | D1 | Усе, що зберігає Worker: записи користувачів, токени прив'язки пристроїв, кеш снімка тривог, статус cron |
+
+Усе постійне сховище — це одна база D1. Окремого KV namespace немає: раніше записи користувачів зберігалися в KV, але проєкт повністю перейшов на D1 (див. `MIGRATION.md`).
+
+### Що і де зберігається
+Таблиця `users` у D1 — єдине місце, де зберігаються дані конкретного користувача (акаунта). Для кожного зареєстрованого Telegram-чату там зберігається:
+- `chat_id` у Telegram;
+- обрані ключі області/району та підсумкова назва регіону;
+- мова, чи увімкнені сповіщення, і чи підключений чат до Telegram;
+- `sync_token` — токен для автентифікації запитів від плагіна;
+- часові мітки: `registered_at`, `last_activity`, `last_check`;
+- останній відомий статус тривоги для регіону користувача (`last_alert_state`, `last_alert_active`, `last_alert_start`, `last_alert_end`);
+- колонка `raw` — дублює всі перелічені поля одним JSON-об'єктом (для сумісності зі старим форматом; це не додаткові дані понад перелічене).
+
+Текст повідомлень, номери телефонів, юзернейми Telegram або точна GPS-локація не збираються — лише обрана область/район і chat_id у Telegram.
+
+Інші таблиці D1:
+- `device_links` — короткоживуча (хвилини), самовидаляюча зв'язка для прив'язки встановлення плагіна до Telegram-чату під час сценарію `/start`; рядки видаляються після використання або після завершення терміну.
+- `cache_kv` — не користувацькі дані: загальний знімок поточного статусу тривог, стан cron і прапорець техробіт, отримані з alerts.in.ua.
+- `notified_events` — ключі дедуплікації (не персональні дані), щоб не надсилати одне й те саме сповіщення двічі.
+
+Панель `/admin` (захищена паролем `ADMIN_TOKEN`) вміє експортувати всю таблицю `users` у вигляді SQL-дампа для бекапу/перенесення — ставтеся до `ADMIN_TOKEN` відповідно.
+
+Під час невдалих спроб входу в `/admin` Worker короткочасно зберігає IP-адресу запиту (в edge-кеші Cloudflare, не в D1) для обмеження частоти спроб; це не пов'язано з жодним Telegram-користувачем і не зберігається довго.
+
+Worker не передає користувацькі дані нікому, крім Telegram (для доставки сповіщень) і alerts.in.ua (для читання публічного, знеособленого статусу тривог).
 
 ### Ендпоінти
 | Метод | Шлях | Опис |
@@ -221,15 +266,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## Changelog
-
-### 2026-10-23 — security patch
-- `/setup-webhook` and `/webhook-info` are no longer reachable without a configured `ADMIN_TOKEN`.
-- A Telegram `/start <deviceId>` can no longer overwrite an existing device binding that belongs to another chat.
-- Region names are HTML-escaped before being sent to Telegram; oversized KV metadata is trimmed.
-- Permanent Telegram delivery errors no longer freeze a user's alert state.
-
-See `SECURITY-PATCH.md` for details and `MIGRATION.md` for moving users from KV to D1 without Node.js.
