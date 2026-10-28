@@ -1511,6 +1511,16 @@ async function handleAdmin(request, env, url) {
       await setMaintenance(env, false, null);
       return adminJson({ ok: true, maintenance: await getMaintenance(env) });
     }
+    if (name === "resync-notify") {
+      const maint = await getMaintenance(env);
+      if (maint.active) return adminJson({ error: "maintenance active: включите после завершения тех. работ" }, 409);
+      const cached = await readCache(env.DB);
+      if (!cached || !cached.data) return adminJson({ error: "нет снапшота в D1" }, 409);
+      const before = await collectUsers(env, cached.data);
+      const hadFailures = await notifyUsers(env, cached.data, cached.data, Date.now(), cached.fetchedAt);
+      const after = await collectUsers(env, cached.data);
+      return adminJson({ ok: true, hadFailures, pendingBefore: before.pending, pendingAfter: after.pending });
+    }
     return adminJson({ error: "unknown action" }, 400);
   }
   return adminJson({ error: "not_found" }, 404);
@@ -1695,7 +1705,7 @@ function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false}
  o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
    +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена cron\\\'ом до завершения. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
    +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
@@ -1714,7 +1724,7 @@ function load(full,kv,quiet,up){busy(1);
   if(full)["upstream","webhook","users","kvWrite"].forEach(function(k){if(d[k])S.f[k]=d[k]});
   S.d=d;draw();if(full&&!quiet)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
 function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
- $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){snack(name+": "+(j.ok?"успешно":JSON.stringify(j).slice(0,120)));load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
+ $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){var msg=j.ok?"успешно":JSON.stringify(j).slice(0,120);if(name==="resync-notify"&&j.ok)msg="готово: ждали "+j.pendingBefore+" → осталось "+j.pendingAfter+(j.hadFailures?" (есть сбои доставки, см. логи)":"");snack(name+": "+msg);load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
 $("dn").onclick=function(){$("scrim").classList.remove("on")};
 $("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
 $("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};$("fab").onclick=function(){load(true)};
