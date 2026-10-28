@@ -7,10 +7,6 @@ keep_vars = true
 # без него wrangler может затереть переменные и секреты, заданные в Dashboard
 # (BOT_TOKEN, ALERTS_API_KEY, ADMIN_TOKEN).
 
-kv_namespaces = [
-  { binding = "USERS", id = "23d60800f794435b8596c28c62de177c" }
-]
-
 d1_databases = [
   { binding = "DB", database_name = "wrangler_d1", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]

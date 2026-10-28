@@ -485,6 +485,28 @@ async function fetchUpstreamRetry(env) {
 }
 
 const CRON_STATUS_KEY = "cron-status";
+const MAINTENANCE_KEY = "maintenance";
+
+async function getMaintenance(env) {
+  try {
+    const raw = await d1GetKV(env.DB, MAINTENANCE_KEY);
+    if (!raw) return { active: false, since: null, message: null };
+    const parsed = JSON.parse(raw);
+    return { active: !!(parsed && parsed.active), since: (parsed && parsed.since) || null, message: (parsed && parsed.message) || null };
+  } catch (e) {
+    console.error("[maintenance] read error:", e);
+    return { active: false, since: null, message: null };
+  }
+}
+
+async function setMaintenance(env, active, message) {
+  await d1PutKV(env.DB, MAINTENANCE_KEY, JSON.stringify({
+    active: !!active,
+    since: new Date().toISOString(),
+    message: active ? (message || "Ведутся технические работы. Часть функций временно недоступна.") : null
+  }));
+}
+
 async function recordCron(env, ok, err) {
   try {
     const prevRaw = await d1GetKV(env.DB, CRON_STATUS_KEY);
@@ -527,7 +549,7 @@ async function getPublicAlerts(env, request, ctx = null) {
   const edge = await caches.default.match(cacheKey);
   if (edge) {
     const payload = await edge.json();
-    return { ...payload, serverTime: new Date().toISOString() };
+    return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
   }
 
   let stored = await readCache(env.DB);
@@ -558,7 +580,7 @@ async function getPublicAlerts(env, request, ctx = null) {
     });
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     else await caches.default.put(cacheKey, response.clone());
-    return { ...payload, serverTime: new Date().toISOString() };
+    return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
   }
 
   const data = await fetchUpstreamShared(env);
@@ -571,7 +593,7 @@ async function getPublicAlerts(env, request, ctx = null) {
   });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
   else await caches.default.put(cacheKey, response.clone());
-  return { ...payload, serverTime: new Date().toISOString() };
+  return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
 }
 
 function stateOf(item) {
@@ -682,10 +704,15 @@ async function checkAllUsers(env) {
   }
 
   if (changed || needsRetryPass) {
-    const hadFailures = await notifyUsers(env, previous.data, data, now, lastWriteAt);
-    const retryAfter = hadFailures ? (retryBefore || now) : 0;
-    if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
-      await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
+    const maint = await getMaintenance(env);
+    if (maint.active) {
+      console.log("[notify] skipped: maintenance mode is active");
+    } else {
+      const hadFailures = await notifyUsers(env, previous.data, data, now, lastWriteAt);
+      const retryAfter = hadFailures ? (retryBefore || now) : 0;
+      if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
+        await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
+      }
     }
   }
 }
@@ -745,21 +772,24 @@ async function deliverChange(env, job, now, lastCheckedAt) {
 
 async function notifyUsers(env, previousData, data, now, lastCheckedAt) {
   const jobs = [];
-  let cursor;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const user = item.metadata || await readUser(env, item.name);
+  const PAGE_SIZE = 500;
+  let offset = 0;
+  while (true) {
+    const rows = await listUsersPage(env, offset, PAGE_SIZE);
+    if (!rows.length) break;
+    for (const row of rows) {
+      const user = rowToUser(row);
       if (!user || !user.chat_id || !user.oblast_key) continue;
       if (user.notify === false) continue;
       const newStatus = alertStatus(data, user.oblast_key, user.district_key);
       const knownState = user.last_alert_state || "clear";
       if (knownState === newStatus.state) continue;
       const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
-      jobs.push({ key: item.name, user, oldStatus, newStatus });
+      jobs.push({ key: `user:${user.chat_id}`, user, oldStatus, newStatus });
     }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
+    offset += rows.length;
+    if (rows.length < PAGE_SIZE) break;
+  }
 
   let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
@@ -890,45 +920,142 @@ async function sendTelegramTracked(env, chatId, text) {
   return await sendTelegramDetailed(env.BOT_TOKEN, chatId, text);
 }
 
-async function readUser(env, key) {
-  try {
-    const result = await env.USERS.getWithMetadata(key);
-    if (!result) return null;
+const USER_COLUMNS = "chat_id, sync_token, oblast_key, district_key, region_name, lang, notify, telegram_connected, registered_at, last_activity, last_check, last_alert_state, last_alert_active, last_alert_start, last_alert_end, raw";
 
-    let userData = result.metadata;
-    if (typeof userData === "string") {
-      try {
-        userData = JSON.parse(userData);
-      } catch (parseErr) {
-        console.error(`[user] failed to parse metadata for ${key}:`, parseErr);
-        return null;
-      }
-    }
-
-    if (userData && typeof userData === "object") return userData;
-  } catch (e) {
-    console.error(`[user] read error for ${key}:`, e);
-  }
-  return null;
+function keyToChatId(key) {
+  return key && String(key).startsWith("user:") ? String(key).slice(5) : null;
 }
 
-function shrinkUserMetadata(user) {
-  let meta = user;
-  const size = () => JSON.stringify(meta).length;
-  if (size() <= 1000) return meta;
-  meta = { ...meta, telegram_first_name: null, telegram_last_name: null, telegram_username: null };
-  if (size() <= 1000) return meta;
-  meta = { ...meta, region_name: String(meta.region_name || "").slice(0, 64) || null };
-  if (size() <= 1000) return meta;
-  return { ...meta, last_alert_end: null, last_alert_start: null, registered_at: null, last_activity: null, last_check: null };
+function rowToUser(row) {
+  if (!row) return null;
+  let extra = {};
+  if (row.raw) {
+    try { const parsed = JSON.parse(row.raw); if (parsed && typeof parsed === "object") extra = parsed; } catch (e) { }
+  }
+  return {
+    ...extra,
+    chat_id: row.chat_id,
+    sync_token: row.sync_token,
+    oblast_key: row.oblast_key,
+    district_key: row.district_key,
+    region_name: row.region_name,
+    lang: row.lang,
+    notify: row.notify !== 0,
+    telegram_connected: !!row.telegram_connected,
+    registered_at: row.registered_at,
+    last_activity: row.last_activity,
+    last_check: row.last_check,
+    last_alert_state: row.last_alert_state,
+    last_alert_active: row.last_alert_active === null || row.last_alert_active === undefined ? undefined : !!row.last_alert_active,
+    last_alert_start: row.last_alert_start,
+    last_alert_end: row.last_alert_end
+  };
+}
+
+function userToRow(chatId, user) {
+  return [
+    String(chatId),
+    user.sync_token || null,
+    user.oblast_key || null,
+    user.district_key || null,
+    user.region_name || null,
+    user.lang || null,
+    user.notify === false ? 0 : 1,
+    user.telegram_connected ? 1 : 0,
+    user.registered_at || null,
+    user.last_activity || null,
+    user.last_check || null,
+    user.last_alert_state || null,
+    user.last_alert_active === true ? 1 : (user.last_alert_active === false ? 0 : null),
+    user.last_alert_start || null,
+    user.last_alert_end || null,
+    JSON.stringify(user)
+  ];
+}
+
+async function readUser(env, key) {
+  const chatId = keyToChatId(key);
+  if (!chatId) return null;
+  try {
+    const row = await env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE chat_id = ?1`).bind(chatId).first();
+    return rowToUser(row);
+  } catch (e) {
+    console.error(`[user] read error for ${key}:`, e);
+    return null;
+  }
 }
 
 async function writeUser(env, key, user) {
+  const chatId = keyToChatId(key) || String(user.chat_id);
   try {
-    await env.USERS.put(key, "", { metadata: shrinkUserMetadata(user) });
+    const vals = userToRow(chatId, user);
+    await env.DB.prepare(
+      `INSERT INTO users (${USER_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+       ON CONFLICT(chat_id) DO UPDATE SET
+         sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key,
+         region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify,
+         telegram_connected=excluded.telegram_connected, registered_at=excluded.registered_at,
+         last_activity=excluded.last_activity, last_check=excluded.last_check,
+         last_alert_state=excluded.last_alert_state, last_alert_active=excluded.last_alert_active,
+         last_alert_start=excluded.last_alert_start, last_alert_end=excluded.last_alert_end, raw=excluded.raw`
+    ).bind(...vals).run();
   } catch (e) {
     console.error(`[user] write error for ${key}:`, e);
     throw e;
+  }
+}
+
+async function deleteUser(env, chatId) {
+  try {
+    await env.DB.prepare("DELETE FROM users WHERE chat_id = ?1").bind(String(chatId)).run();
+  } catch (e) {
+    console.error(`[user] delete error for ${chatId}:`, e);
+    throw e;
+  }
+}
+
+async function listUsersPage(env, offset, limit) {
+  try {
+    const res = await env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users ORDER BY chat_id LIMIT ?1 OFFSET ?2`).bind(limit, offset).all();
+    return (res && res.results) || [];
+  } catch (e) {
+    console.error("[user] list error:", e);
+    return [];
+  }
+}
+
+async function getDeviceLink(env, deviceId) {
+  try {
+    const row = await env.DB.prepare("SELECT chat_id, lang, sync_token, connected_at, expires_at FROM device_links WHERE device_id = ?1").bind(deviceId).first();
+    if (!row) return null;
+    if (row.expires_at && Number(row.expires_at) < Date.now()) {
+      env.DB.prepare("DELETE FROM device_links WHERE device_id = ?1").bind(deviceId).run().catch(() => { });
+      return null;
+    }
+    return { chat_id: row.chat_id, lang: row.lang, sync_token: row.sync_token, connected_at: row.connected_at };
+  } catch (e) {
+    console.error(`[device] read error for ${deviceId}:`, e);
+    return null;
+  }
+}
+
+async function putDeviceLink(env, deviceId, value, ttlSeconds) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO device_links (device_id, chat_id, lang, sync_token, connected_at, expires_at) VALUES (?1,?2,?3,?4,?5,?6)
+       ON CONFLICT(device_id) DO UPDATE SET chat_id=excluded.chat_id, lang=excluded.lang, sync_token=excluded.sync_token, connected_at=excluded.connected_at, expires_at=excluded.expires_at`
+    ).bind(deviceId, value.chat_id, value.lang, value.sync_token, value.connected_at, Date.now() + ttlSeconds * 1000).run();
+  } catch (e) {
+    console.error(`[device] write error for ${deviceId}:`, e);
+    throw e;
+  }
+}
+
+async function deleteDeviceLink(env, deviceId) {
+  try {
+    await env.DB.prepare("DELETE FROM device_links WHERE device_id = ?1").bind(deviceId).run();
+  } catch (e) {
+    console.error(`[device] delete error for ${deviceId}:`, e);
   }
 }
 
@@ -1029,16 +1156,16 @@ async function handleTelegramWebhookInner(request, env) {
       await sendTelegramTracked(env, chatId, M(lang).genericStart);
     } else {
       await sendTelegramTracked(env, chatId, M(lang).linking);
-      const deviceKey = `device:${deviceId}`;
-      const existingLink = await env.USERS.get(deviceKey, "json");
+      const existingLink = await getDeviceLink(env, deviceId);
       if (existingLink && String(existingLink.chat_id) !== String(chatId)) {
         console.warn(`[telegram] device link ${deviceId} already linked to another chat, keeping existing binding`);
       } else {
         const syncToken = await randomToken();
-        await env.USERS.put(
-          deviceKey,
-          JSON.stringify({ chat_id: String(chatId), lang, sync_token: syncToken, connected_at: new Date().toISOString() }),
-          { expirationTtl: DEVICE_LINK_TTL_SECONDS }
+        await putDeviceLink(
+          env,
+          deviceId,
+          { chat_id: String(chatId), lang, sync_token: syncToken, connected_at: new Date().toISOString() },
+          DEVICE_LINK_TTL_SECONDS
         );
       }
     }
@@ -1196,54 +1323,55 @@ function sqlEscape(v) {
 }
 
 async function buildUsersExportSQL(env, overwrite) {
+  // Бэкап/перенос таблицы users из D1 в виде SQL-файла (KV больше не используется,
+  // источник данных — сама таблица D1; полезно для переноса на другую базу).
   const conflict = overwrite
     ? "DO UPDATE SET sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key, region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify, telegram_connected=excluded.telegram_connected, registered_at=excluded.registered_at, last_activity=excluded.last_activity, last_check=excluded.last_check, last_alert_state=excluded.last_alert_state, last_alert_active=excluded.last_alert_active, last_alert_start=excluded.last_alert_start, last_alert_end=excluded.last_alert_end, raw=excluded.raw"
     : "DO NOTHING";
-  const cols = "chat_id, sync_token, oblast_key, district_key, region_name, lang, notify, telegram_connected, registered_at, last_activity, last_check, last_alert_state, last_alert_active, last_alert_start, last_alert_end, raw";
-  // D1 не поддерживает явные BEGIN/COMMIT: каждый запрос автокоммитится.
   const lines = [];
-  let cursor, count = 0, guard = 0;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const item of page.keys || []) {
-      const u = item.metadata;
-      if (!u || typeof u !== "object") continue;
-      const chat = String(item.name).slice(5);
-      if (!/^-?\d+$/.test(chat)) continue;
+  const PAGE_SIZE = 500;
+  let offset = 0, count = 0, guard = 0;
+  while (true) {
+    const rows = await listUsersPage(env, offset, PAGE_SIZE);
+    if (!rows.length) break;
+    for (const row of rows) {
       const vals = [
-        sqlEscape(chat),
-        sqlEscape(u.sync_token),
-        sqlEscape(u.oblast_key),
-        sqlEscape(u.district_key),
-        sqlEscape(u.region_name),
-        sqlEscape(u.lang),
-        u.notify === false ? "0" : "1",
-        u.telegram_connected ? "1" : "0",
-        sqlEscape(u.registered_at),
-        sqlEscape(u.last_activity),
-        sqlEscape(u.last_check),
-        sqlEscape(u.last_alert_state),
-        u.last_alert_active ? "1" : (u.last_alert_active === false ? "0" : "NULL"),
-        sqlEscape(u.last_alert_start),
-        sqlEscape(u.last_alert_end),
-        sqlEscape(JSON.stringify(u))
+        sqlEscape(row.chat_id),
+        sqlEscape(row.sync_token),
+        sqlEscape(row.oblast_key),
+        sqlEscape(row.district_key),
+        sqlEscape(row.region_name),
+        sqlEscape(row.lang),
+        row.notify === 0 ? "0" : "1",
+        row.telegram_connected ? "1" : "0",
+        sqlEscape(row.registered_at),
+        sqlEscape(row.last_activity),
+        sqlEscape(row.last_check),
+        sqlEscape(row.last_alert_state),
+        row.last_alert_active === null || row.last_alert_active === undefined ? "NULL" : (row.last_alert_active ? "1" : "0"),
+        sqlEscape(row.last_alert_start),
+        sqlEscape(row.last_alert_end),
+        sqlEscape(row.raw)
       ];
-      lines.push(`INSERT INTO users (${cols}) VALUES (${vals.join(", ")}) ON CONFLICT(chat_id) ${conflict};`);
+      lines.push(`INSERT INTO users (${USER_COLUMNS}) VALUES (${vals.join(", ")}) ON CONFLICT(chat_id) ${conflict};`);
       count++;
     }
-    cursor = page.list_complete ? null : page.cursor;
-    if (cursor && ++guard >= 100) break;
-  } while (cursor);
+    offset += rows.length;
+    if (rows.length < PAGE_SIZE) break;
+    if (++guard >= 200) break;
+  }
   return { sql: lines.join("\n"), count };
 }
 
 async function collectUsers(env, data) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
-  let cursor, pages = 0;
-  do {
-    const page = await env.USERS.list({ prefix: "user:", limit: 1000, ...(cursor ? { cursor } : {}) });
-    for (const it of page.keys || []) {
-      const u = it.metadata;
+  const PAGE_SIZE = 500;
+  let offset = 0, pages = 0;
+  while (true) {
+    const rows = await listUsersPage(env, offset, PAGE_SIZE);
+    if (!rows.length) break;
+    for (const row of rows) {
+      const u = rowToUser(row);
       if (!u) continue;
       st.total++;
       if (u.notify === false) st.notifyOff++;
@@ -1255,9 +1383,10 @@ async function collectUsers(env, data) {
       st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
       if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
     }
-    cursor = page.list_complete ? null : page.cursor;
-    if (cursor && ++pages >= 10) { st.truncated = true; break; }
-  } while (cursor);
+    offset += rows.length;
+    if (rows.length < PAGE_SIZE) break;
+    if (++pages >= 20) { st.truncated = true; break; }
+  }
   st.byOblast = Object.entries(st.byOblast).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => ({ key: k, name: OBLAST_NAMES_UK[k] || k, n }));
   return st;
 }
@@ -1265,12 +1394,13 @@ async function collectUsers(env, data) {
 async function adminData(env, request, full, kvTest, probeUp) {
   const out = {
     version: WORKER_VERSION, time: new Date().toISOString(), langs: Object.keys(TEXTS),
-    bindings: { alertsKey: !!env.ALERTS_API_KEY, botToken: !!env.BOT_TOKEN, db: !!env.DB, users: !!env.USERS },
+    bindings: { alertsKey: !!env.ALERTS_API_KEY, botToken: !!env.BOT_TOKEN, db: !!env.DB },
     regions: { o: OBLAST_NAMES_UK, d: DISTRICT_NAMES_UK },
     config: { edgeTtl: EDGE_CACHE_TTL_SECONDS, cacheWriteIntervalSec: MIN_CACHE_WRITE_INTERVAL_SECONDS, retryWindowSec: RETRY_WINDOW_MS / 1000 }
   };
   const c = await readCache(env.DB);
   try { const cronRaw = await d1GetKV(env.DB, CRON_STATUS_KEY); out.cron = cronRaw ? JSON.parse(cronRaw) : null; } catch (e) { out.cron = null; }
+  out.maintenance = await getMaintenance(env);
   out.snapshot = c ? {
     fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
     pendingRetry: c.pendingRetry || 0, signature: c.signature,
@@ -1367,6 +1497,19 @@ async function handleAdmin(request, env, url) {
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
       return adminJson({ ok: await caches.default.delete(new Request(u.toString(), { method: "GET" })) });
+    }
+    if (name === "maintenance-on") {
+      let message = null;
+      try {
+        const ct = request.headers.get("Content-Type") || "";
+        if (ct.includes("application/json")) message = (await request.json()).message;
+      } catch (e) { }
+      await setMaintenance(env, true, message);
+      return adminJson({ ok: true, maintenance: await getMaintenance(env) });
+    }
+    if (name === "maintenance-off") {
+      await setMaintenance(env, false, null);
+      return adminJson({ ok: true, maintenance: await getMaintenance(env) });
     }
     return adminJson({ error: "unknown action" }, 400);
   }
@@ -1487,13 +1630,15 @@ function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  return{lvl:lvl,is:is}}
 function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.raions.length:0;
  var T={ok:["✓","Всё работает","Критических проблем не обнаружено"],warn:["!","Есть замечания",""],bad:["✕","Есть проблемы",""]}[h.lvl];
- var o='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
+ var o="";
+ if(d.maintenance&&d.maintenance.active){o+='<div class="hero card warn"><div class="ic">🛠</div><div><b>Технические работы</b><span>'+esc(d.maintenance.message||"Рассылка уведомлений приостановлена")+' · с '+dtm(d.maintenance.since)+'</span></div></div>'}
+ o+='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
  o+='<div class="metrics"><div class="m'+(n?' hl':'')+'"><div class="v">'+n+'</div><div class="l">Активных тревог</div></div>'
   +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.total:"—")+'</div><div class="l">Пользователей</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.pending:"—")+'</div><div class="l">Ждут доставки</div></div></div>';
  var u=f.upstream,w=f.webhook,c=d.cron,L="";
- L+=li("⚙",d.bindings.alertsKey&&d.bindings.botToken&&d.bindings.db&&d.bindings.users?"ok":"bad","Переменные и биндинги","API key "+(d.bindings.alertsKey?"✓":"✕")+" · Bot "+(d.bindings.botToken?"✓":"✕")+" · D1 "+(d.bindings.db?"✓":"✕")+" · KV users "+(d.bindings.users?"✓":"✕"),"","sy");
+ L+=li("⚙",d.bindings.alertsKey&&d.bindings.botToken&&d.bindings.db?"ok":"bad","Переменные и биндинги","API key "+(d.bindings.alertsKey?"✓":"✕")+" · Bot "+(d.bindings.botToken?"✓":"✕")+" · D1 "+(d.bindings.db?"✓":"✕"),"","sy");
  L+=li("◷",!s?"bad":s.ageSeconds>2100?"bad":s.ageSeconds>d.config.cacheWriteIntervalSec?"warn":"ok","Снапшот D1",s?"Обновлено "+dtm(s.fetchedAt)+" · edge-кэш /api: "+(d.edgeCache?"есть":"пуст"):"cron ещё не отработал",s?age(s.ageSeconds):"","sy");
  L+=li("☁",u?(u.ok?"ok":(u.rateLimited?"warn":"bad")):(!s?"bad":(c&&c.state==="fail"?"warn":"ok")),"alerts.in.ua",u?(u.ok?u.oblasts+" областей, "+u.raions+" районов"+(u.sameAsSnapshot===false?" · отличается от снапшота":""):(u.rateLimited?"Живая проверка: лимит запросов (429). На бота это не влияет — он берёт данные через cron":u.error)):(c&&c.state==="fail"?"Cron получает ошибки — см. строку ниже":"Данные приходят через cron без сбоев. Живая проверка — вкладка «Система»"),u?u.ms+" мс":"","sy");
   var c=d.cron;L+=li("⏱",!c?"":(c.state==="fail"?"warn":"ok"),"Опрос alerts.in.ua (cron)",!c?"Сбоев не зафиксировано":(c.state==="fail"?"Сбой с "+dtm(c.since)+": "+c.error:"Восстановлен "+dtm(c.at)+" (сбой был с "+dtm(c.recoveredFrom)+")"),"","sy");
@@ -1546,7 +1691,10 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Состояние (last_alert_state)",bars(t.byState,tot));
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
-function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="";
+function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false};
+ o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
+   +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена cron\\\'ом до завершения. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
+   +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
  o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
@@ -1647,7 +1795,7 @@ export default {
 
     const deviceMatch = url.pathname.match(/^\/telegram\/get-chat-id\/([a-zA-Z0-9-]+)$/);
     if (deviceMatch && method === "GET") {
-      const data = await env.USERS.get(`device:${deviceMatch[1]}`, "json");
+      const data = await getDeviceLink(env, deviceMatch[1]);
       if (data && data.chat_id && data.sync_token) return json({ ok: true, chat_id: data.chat_id, sync_token: data.sync_token, lang: normLang(data.lang) });
       return json({ ok: false, chat_id: null });
     }
@@ -1666,7 +1814,7 @@ export default {
 
         let deviceLink = null;
         if (body.device_id) {
-          const candidate = await env.USERS.get(`device:${body.device_id}`, "json");
+          const candidate = await getDeviceLink(env, body.device_id);
           if (candidate && String(candidate.chat_id) === String(chat_id) && validSyncToken(candidate, sync_token)) {
             deviceLink = candidate;
           }
@@ -1740,7 +1888,7 @@ export default {
           existing.sync_token === token;
         if (!nothingChanged) await writeUser(env, key, userData);
         const isNewDeviceLink = !!deviceLink;
-        if (deviceLink) await env.USERS.delete(`device:${body.device_id}`);
+        if (deviceLink) await deleteDeviceLink(env, body.device_id);
 
         const sendNotifications = async () => {
           const m = M(lang);
@@ -1794,7 +1942,7 @@ export default {
           return json({ error: "invalid sync token" }, 403);
         }
 
-        await env.USERS.delete(`user:${chat_id}`);
+        await deleteUser(env, chat_id);
         await sendTelegramTracked(env, chat_id, M(existing.lang).unsubscribed);
 
         return json({ ok: true, existed: true });
@@ -1829,5 +1977,10 @@ export default {
 
   async scheduled(event, env, ctx) {
     await checkAllUsers(env);
-          }
+    ctx.waitUntil(
+      env.DB.prepare("DELETE FROM device_links WHERE expires_at < ?1").bind(Date.now()).run().catch(e => {
+        console.error("[device] cleanup error:", e);
+      })
+    );
+  }
 };
