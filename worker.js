@@ -34,7 +34,6 @@ const RETRY_WINDOW_MS = 5 * 60 * 1000;
 const DETECTION_GAP_MS = 3 * 60 * 1000;
 const SNAPSHOT_KEY = "alerts-in-ua";
 const DEVICE_LINK_TTL_SECONDS = 600;
-const MAX_LOCATIONS = 10;
 const UPDATE_DEDUP_TTL_SECONDS = 120;
 const SYNC_TOKEN_BYTES = 18;
 const KYIV_TZ = "Europe/Kyiv";
@@ -719,12 +718,12 @@ async function checkAllUsers(env) {
 }
 
 async function deliverChange(env, job, now, lastCheckedAt) {
-  const { key, user, loc, oldStatus, newStatus } = job;
+  const { key, user, oldStatus, newStatus } = job;
   let text;
   const m = M(user.lang);
-  const rn = escapeHtml(loc.region_name);
+  const rn = escapeHtml(user.region_name);
   if (newStatus.state === "clear") {
-    const start = oldStatus.since || loc.last_alert_start;
+    const start = oldStatus.since || user.last_alert_start;
 
     const detectionGap = lastCheckedAt ? now - lastCheckedAt : Infinity;
     const uncertain = detectionGap > DETECTION_GAP_MS;
@@ -740,36 +739,28 @@ async function deliverChange(env, job, now, lastCheckedAt) {
       text = duration ? m.clearEnd(rn, formatTimeKyiv(new Date(start)), formatTimeKyiv(new Date(now)), duration) : m.clear(rn);
     }
   } else {
-    text = stateMessage(loc.region_name, newStatus, user.lang);
+    text = stateMessage(user.region_name, newStatus, user.lang);
   }
   const dedupeOccurrence = newStatus.state === "clear"
-    ? (oldStatus.since || loc.last_alert_start || "")
+    ? (oldStatus.since || user.last_alert_start || "")
     : (newStatus.since || "");
-  const dedupeName = `notified:${user.chat_id}:${job.locIndex}:${newStatus.state}:${dedupeOccurrence}`;
+  const dedupeName = `notified:${user.chat_id}:${newStatus.state}:${dedupeOccurrence}`;
   const claimed = await tryClaimNotification(env.DB, dedupeName);
   const res = !claimed ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
   if (!res.ok && !res.permanent) {
     if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
-    console.error(`[notify] delivery failed for chat ${user.chat_id} loc ${job.locIndex}, will retry`);
+    console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry`);
     return false;
   }
   if (!res.ok && res.permanent) {
-    console.error(`[notify] permanent failure for chat ${user.chat_id} loc ${job.locIndex} (HTTP ${res.status}), keeping old state and scheduling retry`);
+    console.error(`[notify] permanent failure for chat ${user.chat_id} (HTTP ${res.status}), keeping old state and scheduling retry`);
     if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
     return false;
   }
-  loc.last_alert_state = newStatus.state;
-  loc.last_alert_active = newStatus.state !== "clear";
-  loc.last_alert_start = newStatus.state === "clear" ? null : newStatus.since;
-  loc.last_alert_end = newStatus.state === "clear" ? new Date(now).toISOString() : null;
-  if (job.locIndex === 0) {
-    // Mirror the primary location's state into the legacy top-level columns
-    // (admin panel, /status command, old single-location clients).
-    user.last_alert_state = loc.last_alert_state;
-    user.last_alert_active = loc.last_alert_active;
-    user.last_alert_start = loc.last_alert_start;
-    user.last_alert_end = loc.last_alert_end;
-  }
+  user.last_alert_state = newStatus.state;
+  user.last_alert_active = newStatus.state !== "clear";
+  user.last_alert_start = newStatus.state === "clear" ? null : newStatus.since;
+  user.last_alert_end = newStatus.state === "clear" ? new Date(now).toISOString() : null;
   user.last_check = new Date(now).toISOString();
   try {
     await writeUser(env, key, user);
@@ -788,27 +779,13 @@ async function notifyUsers(env, previousData, data, now, lastCheckedAt) {
     if (!rows.length) break;
     for (const row of rows) {
       const user = rowToUser(row);
-      if (!user || !user.chat_id) continue;
+      if (!user || !user.chat_id || !user.oblast_key) continue;
       if (user.notify === false) continue;
-      // locationsFromExisting() falls back to the legacy single oblast_key/
-      // district_key columns when there's no `locations` array yet, so
-      // single-location accounts (the vast majority) are handled exactly as
-      // before — just via a one-item list.
-      const locs = locationsFromExisting(user);
-      if (!locs.length) continue;
-      // `user.locations` is kept as the SAME array (not a copy) so every job
-      // for this user mutates and persists the one shared in-memory object;
-      // concurrent jobs for the same account (different locations) then
-      // can't clobber each other's state when they're written back below.
-      user.locations = locs;
-      for (let i = 0; i < locs.length; i++) {
-        const loc = locs[i];
-        const newStatus = alertStatus(data, loc.oblast_key, loc.district_key);
-        const knownState = loc.last_alert_state || "clear";
-        if (knownState === newStatus.state) continue;
-        const oldStatus = alertStatus(previousData, loc.oblast_key, loc.district_key);
-        jobs.push({ key: `user:${user.chat_id}`, user, loc, locIndex: i, oldStatus, newStatus });
-      }
+      const newStatus = alertStatus(data, user.oblast_key, user.district_key);
+      const knownState = user.last_alert_state || "clear";
+      if (knownState === newStatus.state) continue;
+      const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
+      jobs.push({ key: `user:${user.chat_id}`, user, oldStatus, newStatus });
     }
     offset += rows.length;
     if (rows.length < PAGE_SIZE) break;
@@ -901,70 +878,6 @@ function escapeHtml(s) {
 function trimLen(s, n) {
   s = String(s || "").trim();
   return s.slice(0, n) || null;
-}
-
-// --- Multi-location helpers -------------------------------------------------
-// A "location" is {oblast_key, district_key, region_name, last_alert_state,
-// last_alert_active, last_alert_start, last_alert_end}. Up to MAX_LOCATIONS are
-// kept per user. locations[0] is mirrored into the legacy oblast_key/district_key
-// /region_name/last_alert_* columns so old clients, the admin panel and the
-// /status command keep working unchanged for single-location accounts.
-
-function normalizeLocationsInput(body) {
-  // undefined  -> client said nothing about locations this call (legacy ping,
-  //               a toggle, a resync) — caller must NOT touch stored locations.
-  // [] / [...] -> client explicitly set its location list (may be empty to clear it).
-  if (!Array.isArray(body.locations)) return undefined;
-  const seen = new Set();
-  const out = [];
-  for (const l of body.locations) {
-    if (!l || !l.oblast_key) continue;
-    const ok = String(l.oblast_key);
-    const dk = l.district_key ? String(l.district_key) : null;
-    const dedupeKey = ok + ":" + (dk || "");
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-    out.push({ oblast_key: ok, district_key: dk, region_name: trimLen(l.region_name, 80) || "Unknown" });
-    if (out.length >= MAX_LOCATIONS) break;
-  }
-  return out;
-}
-
-function validateLocationsArray(locations) {
-  for (const l of locations) {
-    if (!OBLAST_NAMES_UK[l.oblast_key]) return `unknown oblast_key: ${l.oblast_key}`;
-    if (l.district_key && !DISTRICT_NAMES_UK[l.oblast_key + ":" + l.district_key]) {
-      return `unknown district_key: ${l.district_key}`;
-    }
-  }
-  return null;
-}
-
-function locationsFromExisting(existing) {
-  if (!existing) return [];
-  if (Array.isArray(existing.locations) && existing.locations.length) return existing.locations;
-  if (existing.oblast_key) {
-    return [{
-      oblast_key: existing.oblast_key, district_key: existing.district_key || null,
-      region_name: existing.region_name || "Unknown",
-      last_alert_state: existing.last_alert_state, last_alert_active: existing.last_alert_active,
-      last_alert_start: existing.last_alert_start, last_alert_end: existing.last_alert_end
-    }];
-  }
-  return [];
-}
-
-function locationsEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (String(a[i].oblast_key || "") !== String(b[i].oblast_key || "")) return false;
-    if (String(a[i].district_key || "") !== String(b[i].district_key || "")) return false;
-  }
-  return true;
-}
-
-function statusForLocations(snapshotData, locations) {
-  return locations.map(l => alertStatus(snapshotData, l.oblast_key, l.district_key));
 }
 
 async function sendTelegramDetailed(botToken, chatId, text) {
@@ -1246,7 +1159,6 @@ async function handleTelegramWebhookInner(request, env) {
       const existingLink = await getDeviceLink(env, deviceId);
       if (existingLink && String(existingLink.chat_id) !== String(chatId)) {
         console.warn(`[telegram] device link ${deviceId} already linked to another chat, keeping existing binding`);
-        await sendTelegramTracked(env, chatId, M(lang).genericStart);
       } else {
         const syncToken = await randomToken();
         await putDeviceLink(
@@ -1265,16 +1177,13 @@ async function handleTelegramWebhookInner(request, env) {
     const user = await readUser(env, `user:${chatId}`);
     const lang = normLang((user && user.lang) || (message.from && message.from.language_code));
     const m = M(lang);
-    const locs = locationsFromExisting(user);
-    if (!locs.length) {
+    if (!user || !user.oblast_key) {
       await sendTelegramTracked(env, chatId, m.statusNoRegion);
     } else {
       try {
         const snapshot = await getSharedSnapshot(env);
-        for (const loc of locs) {
-          const status = alertStatus(snapshot.data, loc.oblast_key, loc.district_key);
-          await sendTelegramTracked(env, chatId, stateMessage(loc.region_name || loc.oblast_key, status, lang));
-        }
+        const status = alertStatus(snapshot.data, user.oblast_key, user.district_key);
+        await sendTelegramTracked(env, chatId, stateMessage(user.region_name || user.oblast_key, status, lang));
       } catch (e) {
         console.error("[status] on-demand status failed:", e);
       }
@@ -1909,7 +1818,6 @@ export default {
         if (body.device_id && !/^[a-zA-Z0-9-]{1,64}$/.test(String(body.device_id))) {
           return json({ error: "invalid device_id" }, 400);
         }
-        if (!oblast_key && district_key) return json({ error: "district_key without oblast_key" }, 400);
 
         const key = `user:${chat_id}`;
         const existing = await readUser(env, key);
@@ -1940,85 +1848,51 @@ export default {
           ? ((typeof sync_token === "string" && sync_token) || await randomToken())
           : ((existing && existing.sync_token) || (typeof sync_token === "string" && sync_token) || await randomToken());
 
-        // --- Resolve the location list --------------------------------
-        // `incoming` is undefined when this call's payload says nothing about
-        // locations at all (a plain toggle / resync ping) — in that case we
-        // must leave whatever is stored untouched. It's an array (possibly
-        // empty, to explicitly clear it) when the client set its location(s)
-        // this call, either via the new `locations` field or the legacy
-        // single oblast_key/district_key fields.
-        const incomingMulti = normalizeLocationsInput(body);
-        const incomingLegacy = oblast_key
-          ? [{ oblast_key: String(oblast_key), district_key: district_key ? String(district_key) : null, region_name: trimLen(region_name, 80) || "Unknown" }]
-          : undefined;
-        const incoming = incomingMulti !== undefined ? incomingMulti : incomingLegacy;
-
-        const existingLocations = locationsFromExisting(existing);
-        const relinked = !!deviceLink;
-        // BUG FIX ("account recognized but nothing happens on reconnect"):
-        // connecting through the bot after deleting/reinstalling the plugin,
-        // or on a different device, always sent an empty location (the local
-        // settings are gone) — which used to permanently overwrite the
-        // oblast/district already saved server-side for this Telegram
-        // account with "none selected". The account IS recognized here (same
-        // chat_id already has a user row with saved locations); treat a
-        // relink with no location in the payload as a "log in" and restore
-        // the saved location(s) instead of wiping them.
-        const restoredFromAccount = incoming === undefined && relinked && existingLocations.length > 0;
-        let locations = incoming !== undefined ? incoming : existingLocations;
-        if (locations.length > MAX_LOCATIONS) locations = locations.slice(0, MAX_LOCATIONS);
-
-        const badLocation = validateLocationsArray(locations);
-        if (badLocation) return json({ error: badLocation }, 400);
-
-        const hasLocation = locations.length > 0;
-        const sameLocation = locationsEqual(existingLocations, locations);
+        const sameLocation = !!existing &&
+          String(existing.oblast_key || "") === String(oblast_key || "") &&
+          String(existing.district_key || "") === String(district_key || "");
 
         const prevNotify = existing ? existing.notify !== false : true;
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
+        const relinked = !!deviceLink;
         const resync = !existing || !sameLocation || (notifyChanged && notify) || relinked;
         const changed = !existing || !sameLocation || notifyChanged || relinked;
 
+        const hasLocation = !!oblast_key;
+        if (hasLocation && !OBLAST_NAMES_UK[String(oblast_key)]) return json({ error: "unknown oblast_key" }, 400);
+        if (hasLocation && district_key && !DISTRICT_NAMES_UK[String(oblast_key) + ":" + String(district_key)]) {
+          return json({ error: "unknown district_key" }, 400);
+        }
+        if (!hasLocation && district_key) return json({ error: "district_key without oblast_key" }, 400);
+        const safeRegionName = hasLocation ? (trimLen(region_name, 80) || "Unknown") : null;
         const snapshot = hasLocation ? await getSharedSnapshot(env) : null;
-        const statuses = hasLocation ? statusForLocations(snapshot.data, locations) : [];
-
-        const mergedLocations = locations.map((l, i) => {
-          const prior = resync ? null : (existingLocations[i] || null);
-          const status = statuses[i] || { state: "clear", since: null };
-          return {
-            oblast_key: l.oblast_key, district_key: l.district_key, region_name: l.region_name,
-            last_alert_state: !prior ? status.state : (prior.last_alert_state || (prior.last_alert_active ? "red" : "clear")),
-            last_alert_active: !prior ? status.state !== "clear" : prior.last_alert_active,
-            last_alert_start: !prior ? status.since : prior.last_alert_start,
-            last_alert_end: !prior ? null : prior.last_alert_end
-          };
-        });
-
-        const primary = mergedLocations[0] || null;
-        const safeRegionName = primary ? primary.region_name : null;
+        const status = hasLocation
+          ? alertStatus(snapshot.data, String(oblast_key), district_key ? String(district_key) : null)
+          : { state: "clear", since: null };
 
         const userData = {
           chat_id: String(chat_id),
           sync_token: token,
-          oblast_key: primary ? primary.oblast_key : null,
-          district_key: primary ? primary.district_key : null,
+          oblast_key: hasLocation ? String(oblast_key) : null,
+          district_key: hasLocation && district_key ? String(district_key) : null,
           region_name: safeRegionName,
-          locations: mergedLocations,
           lang,
           notify,
           last_activity: new Date().toISOString(),
           telegram_connected: true,
           registered_at: existing && existing.registered_at ? existing.registered_at : new Date().toISOString(),
           last_check: new Date().toISOString(),
-          last_alert_state: primary ? primary.last_alert_state : (existing ? existing.last_alert_state : null),
-          last_alert_active: primary ? primary.last_alert_active : (existing ? existing.last_alert_active : null),
-          last_alert_start: primary ? primary.last_alert_start : (existing ? existing.last_alert_start : null),
-          last_alert_end: primary ? primary.last_alert_end : (existing ? existing.last_alert_end : null)
+          last_alert_state: resync ? status.state : (existing.last_alert_state || (existing.last_alert_active ? "red" : "clear")),
+          last_alert_active: resync ? status.state !== "clear" : existing.last_alert_active,
+          last_alert_start: resync ? status.since : existing.last_alert_start,
+          last_alert_end: resync ? null : existing.last_alert_end
         };
 
         const nothingChanged = !!existing && !relinked &&
-          sameLocation &&
+          String(existing.oblast_key || "") === String(userData.oblast_key || "") &&
+          String(existing.district_key || "") === String(userData.district_key || "") &&
+          String(existing.region_name || "") === String(userData.region_name || "") &&
           normLang(existing.lang) === userData.lang &&
           (existing.notify !== false) === notify &&
           existing.sync_token === token;
@@ -2032,15 +1906,9 @@ export default {
             await sendTelegramTracked(env, chat_id, m.connected);
           }
           if (notify) {
-            // Don't re-announce "subscription active" for every saved location
-            // just because the account reconnected from a new install/device —
-            // the "bot connected" message above is confirmation enough.
-            if (hasLocation && (!existing || !sameLocation || notifyChanged || relinked) && !restoredFromAccount) {
-              for (let i = 0; i < mergedLocations.length; i++) {
-                const loc = mergedLocations[i];
-                await sendTelegramTracked(env, chat_id, m.subscribed(escapeHtml(loc.region_name)));
-                await sendTelegramTracked(env, chat_id, stateMessage(loc.region_name, statuses[i] || { state: loc.last_alert_state, since: loc.last_alert_start }, lang));
-              }
+            if (hasLocation && (!existing || !sameLocation || notifyChanged || relinked)) {
+              await sendTelegramTracked(env, chat_id, m.subscribed(escapeHtml(safeRegionName)));
+              await sendTelegramTracked(env, chat_id, stateMessage(region_name, status, lang));
             } else if (!hasLocation && notifyChanged) {
               await sendTelegramTracked(env, chat_id, m.enabled);
             }
@@ -2059,18 +1927,10 @@ export default {
           changed,
           notify,
           sync_token: token,
-          // Echoed back so the client can restore local settings after a
-          // reconnect that pulled in the account's saved location(s) — see
-          // the BUG FIX note above. Old clients that don't read these fields
-          // are unaffected.
-          oblast_key: primary ? primary.oblast_key : null,
-          district_key: primary ? primary.district_key : null,
-          region_name: safeRegionName,
-          locations: mergedLocations.map(l => ({ oblast_key: l.oblast_key, district_key: l.district_key, region_name: l.region_name })),
           status: {
-            state: primary ? primary.last_alert_state : null,
-            active: primary ? primary.last_alert_active : null,
-            since: primary ? primary.last_alert_start : null,
+            state: hasLocation ? status.state : null,
+            active: hasLocation ? status.state !== "clear" : null,
+            since: hasLocation ? status.since : null,
             fetchedAt: snapshot ? snapshot.fetchedAt : null,
             lastUpstreamCheckAt: snapshot ? (snapshot.heartbeat || null) : null,
             stale: snapshot ? (snapshot.heartbeat ? (Date.now() - snapshot.heartbeat > 180000) : true) : null
