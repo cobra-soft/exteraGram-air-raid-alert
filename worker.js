@@ -28,8 +28,11 @@ const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
 const WORKER_VERSION = "air-raid-panel-2026-10-01";
 const SEND_CONCURRENCY = 15;
-const MIN_CACHE_WRITE_INTERVAL_SECONDS = 1800;
+const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
+const STALE_SNAPSHOT_MS = 35 * 60 * 1000;
+const MAX_LOCATIONS = 10;
+const MAX_SESSIONS = 20;
 
 const DETECTION_GAP_MS = 3 * 60 * 1000;
 const SNAPSHOT_KEY = "alerts-in-ua";
@@ -288,10 +291,14 @@ async function readCache(db) {
 }
 
 async function writeCache(db, data, fetchedAt = Date.now(), signature = null, pendingRetry = 0) {
+  const snapshot = {
+    oblasts: Array.isArray(data && data.oblasts) ? data.oblasts : [],
+    raions: Array.isArray(data && data.raions) ? data.raions : []
+  };
   await d1PutKV(
     db,
     SNAPSHOT_KEY,
-    JSON.stringify({ fetchedAt, signature: signature || buildStatusSignature(data), data, pendingRetry: Number(pendingRetry) || 0 })
+    JSON.stringify({ fetchedAt, signature: signature || buildStatusSignature(snapshot), data: snapshot, pendingRetry: Number(pendingRetry) || 0 })
   );
 }
 
@@ -391,13 +398,17 @@ async function fetchUpstream(env) {
     throw err;
   }
   const json = await r.json();
-  if (!json.alerts) return { alerts: [], oblasts: [], raions: [] };
+  if (!json || typeof json !== "object" || !Array.isArray(json.alerts)) {
+    throw new Error("alerts.in.ua: invalid response (alerts is not an array)");
+  }
 
   const oblasts = {};
   const raions = [];
+  const seenRaions = new Set();
 
   for (const alert of json.alerts) {
-    if (alert.alert_type !== 'air_raid') continue;
+    if (!alert || typeof alert !== "object") continue;
+    if (alert.alert_type !== "air_raid") continue;
 
     const oblastSlug = OBLAST_NAME_NORM_TO_SLUG[normalizeUk(alert.location_oblast)];
     if (!oblastSlug) {
@@ -405,7 +416,19 @@ async function fetchUpstream(env) {
       continue;
     }
 
-    if (alert.location_type === 'oblast') {
+    let locationType = String(alert.location_type || "").trim();
+    let raionName = alert.location_raion || alert.location_title;
+
+    if (locationType === "hromada" || locationType === "city" || locationType === "settlement") {
+      if (alert.location_raion) {
+        locationType = "raion";
+        raionName = alert.location_raion;
+      } else if (oblastSlug === "kyiv-city" || oblastSlug === "sevastopol-city") {
+        locationType = "oblast";
+      }
+    }
+
+    if (locationType === "oblast") {
       oblasts[oblastSlug] = {
         key: oblastSlug,
         name: alert.location_oblast,
@@ -413,8 +436,7 @@ async function fetchUpstream(env) {
         alert_level: alert.alert_level,
         started_at: alert.started_at
       };
-    } else if (alert.location_type === 'raion') {
-      const raionName = alert.location_raion || alert.location_title;
+    } else if (locationType === "raion") {
       if (!raionName) {
         console.error(`[alerts.in.ua] raion alert with no name (id ${alert.id}) in ${alert.location_oblast}`);
         continue;
@@ -425,8 +447,11 @@ async function fetchUpstream(env) {
         console.error(`[alerts.in.ua] unknown district name: ${raionName} in ${alert.location_oblast}`);
         continue;
       }
+      const key = `${oblastSlug}:${districtSlug}`;
+      if (seenRaions.has(key)) continue;
+      seenRaions.add(key);
       raions.push({
-        key: `${oblastSlug}:${districtSlug}`,
+        key,
         oblast: alert.location_oblast,
         name: raionName,
         alert_level: alert.alert_level,
@@ -535,9 +560,14 @@ async function getSharedSnapshot(env) {
 
   const data = await fetchUpstreamShared(env);
   const fetchedAt = Date.now();
-  const signature = buildStatusSignature(data);
-  await writeCache(env.DB, data, fetchedAt, signature);
-  return { fetchedAt, signature, data, heartbeat: fetchedAt };
+  const publicData = {
+    oblasts: Array.isArray(data && data.oblasts) ? data.oblasts : [],
+    raions: Array.isArray(data && data.raions) ? data.raions : []
+  };
+  const signature = buildStatusSignature(publicData);
+  const maintenance = await getMaintenance(env);
+  if (!maintenance.active) await writeCache(env.DB, publicData, fetchedAt, signature);
+  return { fetchedAt, signature, data: publicData, heartbeat: fetchedAt };
 }
 
 async function getPublicAlerts(env, request, ctx = null) {
@@ -545,22 +575,27 @@ async function getPublicAlerts(env, request, ctx = null) {
   u.pathname = "/api";
   u.search = "";
   const cacheKey = new Request(u.toString(), { method: "GET" });
+  const maintenance = await getMaintenance(env);
 
   const edge = await caches.default.match(cacheKey);
   if (edge) {
     const payload = await edge.json();
-    return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
+    return { ...payload, serverTime: new Date().toISOString(), maintenance };
   }
 
   let stored = await readCache(env.DB);
-  if (stored && stored.fetchedAt && Date.now() - stored.fetchedAt > 2100000 && !(await hasEphemeralFlag("live-refresh"))) {
+  if (stored && stored.fetchedAt && Date.now() - stored.fetchedAt > STALE_SNAPSHOT_MS && !maintenance.active && !(await hasEphemeralFlag("live-refresh"))) {
     await setEphemeralFlag("live-refresh", 20);
     try {
       const liveData = await fetchUpstreamShared(env);
+      const livePublic = {
+        oblasts: Array.isArray(liveData && liveData.oblasts) ? liveData.oblasts : [],
+        raions: Array.isArray(liveData && liveData.raions) ? liveData.raions : []
+      };
       const liveAt = Date.now();
-      const liveSig = buildStatusSignature(liveData);
-      await writeCache(env.DB, liveData, liveAt, liveSig);
-      stored = { fetchedAt: liveAt, signature: liveSig, data: liveData };
+      const liveSig = buildStatusSignature(livePublic);
+      await writeCache(env.DB, livePublic, liveAt, liveSig);
+      stored = { fetchedAt: liveAt, signature: liveSig, data: livePublic };
     } catch (e) {
       console.error("[api] live refresh failed:", e);
     }
@@ -572,7 +607,7 @@ async function getPublicAlerts(env, request, ctx = null) {
       fetchedAt: stored.fetchedAt,
       snapshotSignature: stored.signature || buildStatusSignature(stored.data),
       lastUpstreamCheckAt: heartbeat || null,
-      stale: heartbeat ? (Date.now() - heartbeat > 2100000) : false,
+      stale: heartbeat ? (Date.now() - heartbeat > STALE_SNAPSHOT_MS) : false,
       staleAgeSeconds: heartbeat ? Math.max(0, Math.round((Date.now() - heartbeat) / 1000)) : null
     };
     const response = new Response(JSON.stringify(payload), {
@@ -580,20 +615,162 @@ async function getPublicAlerts(env, request, ctx = null) {
     });
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     else await caches.default.put(cacheKey, response.clone());
-    return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
+    return { ...payload, serverTime: new Date().toISOString(), maintenance };
   }
 
   const data = await fetchUpstreamShared(env);
   const fetchedAt = Date.now();
-  const signature = buildStatusSignature(data);
-  await writeCache(env.DB, data, fetchedAt, signature);
-  const payload = { ...data, fetchedAt, snapshotSignature: signature, lastUpstreamCheckAt: fetchedAt, stale: false, staleAgeSeconds: 0 };
+  const publicData = {
+    oblasts: Array.isArray(data && data.oblasts) ? data.oblasts : [],
+    raions: Array.isArray(data && data.raions) ? data.raions : []
+  };
+  const signature = buildStatusSignature(publicData);
+  if (!maintenance.active) await writeCache(env.DB, publicData, fetchedAt, signature);
+  const payload = { ...publicData, fetchedAt, snapshotSignature: signature, lastUpstreamCheckAt: fetchedAt, stale: false, staleAgeSeconds: 0 };
   const response = new Response(JSON.stringify(payload), {
     headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${EDGE_CACHE_TTL_SECONDS}` }
   });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
   else await caches.default.put(cacheKey, response.clone());
-  return { ...payload, serverTime: new Date().toISOString(), maintenance: await getMaintenance(env) };
+  return { ...payload, serverTime: new Date().toISOString(), maintenance };
+}
+
+function defaultLocationName(oblastKey, districtKey) {
+  const oblastName = OBLAST_NAMES_UK[oblastKey] || oblastKey;
+  if (!districtKey) return oblastName;
+  const districtName = DISTRICT_NAMES_UK[`${oblastKey}:${districtKey}`];
+  return districtName ? `${oblastName} · ${districtName}` : oblastName;
+}
+
+function normalizeLocation(item) {
+  if (!item || typeof item !== "object") return null;
+  const oblastKey = String(item.oblast_key || "").trim();
+  if (!oblastKey || !OBLAST_NAMES_UK[oblastKey]) return null;
+  const rawDistrict = item.district_key == null ? "" : String(item.district_key).trim();
+  const districtKey = rawDistrict || null;
+  if (districtKey && !DISTRICT_NAMES_UK[`${oblastKey}:${districtKey}`]) return null;
+  const regionName = trimLen(item.region_name, 80) || defaultLocationName(oblastKey, districtKey);
+  return { oblast_key: oblastKey, district_key: districtKey, region_name: regionName };
+}
+
+function locationKey(location) {
+  if (!location) return "";
+  const oblastKey = String(location.oblast_key || "");
+  const districtKey = String(location.district_key || "");
+  return districtKey ? `${oblastKey}:${districtKey}` : oblastKey;
+}
+
+function parseLocationsInput(raw) {
+  if (!Array.isArray(raw) || raw.length > MAX_LOCATIONS) return null;
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const location = normalizeLocation(item);
+    if (!location) return null;
+    const key = locationKey(location);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(location);
+  }
+  return out;
+}
+
+function userLocations(user) {
+  const out = [];
+  const seen = new Set();
+  if (user && Array.isArray(user.locations)) {
+    for (const item of user.locations) {
+      const location = normalizeLocation(item);
+      if (!location) continue;
+      const key = locationKey(location);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(location);
+      if (out.length >= MAX_LOCATIONS) break;
+    }
+  }
+  if (!out.length && user && user.oblast_key) {
+    const legacy = normalizeLocation({
+      oblast_key: user.oblast_key,
+      district_key: user.district_key,
+      region_name: user.region_name
+    });
+    if (legacy) out.push(legacy);
+  }
+  return out;
+}
+
+function locationsEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (locationKey(a[i]) !== locationKey(b[i])) return false;
+  }
+  return true;
+}
+
+function normalizeSessions(user) {
+  const out = [];
+  const seen = new Set();
+  const push = (token, deviceId, createdAt) => {
+    if (typeof token !== "string" || !token || seen.has(token)) return;
+    seen.add(token);
+    out.push({ token, device_id: deviceId || null, created_at: createdAt || null });
+  };
+  if (user && user.sync_token) push(user.sync_token, null, user.registered_at);
+  if (user && Array.isArray(user.sessions)) {
+    for (const item of user.sessions) {
+      if (typeof item === "string") push(item, null, null);
+      else if (item && typeof item === "object") push(item.token, item.device_id, item.created_at);
+    }
+  }
+  return out.slice(-MAX_SESSIONS);
+}
+
+function addSession(user, token, deviceId) {
+  const sessions = normalizeSessions(user);
+  if (!sessions.some(s => s.token === token)) {
+    sessions.push({ token, device_id: deviceId || null, created_at: new Date().toISOString() });
+  }
+  user.sessions = sessions.slice(-MAX_SESSIONS);
+}
+
+function isValidToken(existing, token) {
+  if (!existing || typeof token !== "string" || !token) return false;
+  if (existing.sync_token === token) return true;
+  return Array.isArray(existing.sessions) && existing.sessions.some(s =>
+    s && (typeof s === "string" ? s : s.token) === token
+  );
+}
+
+function applyLegacyFields(user) {
+  const locations = userLocations(user);
+  const first = locations[0] || null;
+  user.locations = locations;
+  user.oblast_key = first ? first.oblast_key : null;
+  user.district_key = first ? first.district_key : null;
+  user.region_name = first ? first.region_name : null;
+
+  const states = user.location_states && typeof user.location_states === "object" ? user.location_states : {};
+  let worst = "clear";
+  let start = null;
+  let end = null;
+  for (const location of locations) {
+    const state = states[locationKey(location)];
+    if (!state || typeof state !== "object") continue;
+    if (state.state === "red") worst = "red";
+    else if (state.state === "yellow" && worst !== "red") worst = "yellow";
+    if (state.state !== "clear" && typeof state.since === "string") {
+      if (!start || state.since < start) start = state.since;
+    }
+    if (state.state === "clear" && typeof state.end === "string") {
+      if (!end || state.end > end) end = state.end;
+    }
+  }
+  user.last_alert_state = worst;
+  user.last_alert_active = worst !== "clear";
+  user.last_alert_start = worst === "clear" ? null : start;
+  user.last_alert_end = worst === "clear" ? end : null;
+  return user;
 }
 
 function stateOf(item) {
@@ -607,12 +784,12 @@ function buildStateSignature(data) {
   for (const x of (data?.oblasts || [])) {
     if (!x || typeof x !== "object") continue;
     const key = String(x.key || "");
-    if (key) items.push(`o:${key}:${stateOf(x)}`);
+    if (key) items.push(`o:${key}:${stateOf(x)}:${x.started_at || ""}`);
   }
   for (const x of (data?.raions || [])) {
     if (!x || typeof x !== "object") continue;
     const key = String(x.key || "");
-    if (key) items.push(`r:${key}:${stateOf(x)}`);
+    if (key) items.push(`r:${key}:${stateOf(x)}:${x.started_at || ""}`);
   }
   items.sort((a,b) => a.localeCompare(b));
   return JSON.stringify(items);
@@ -651,8 +828,8 @@ function alertStatus(data, oblastKey, districtKey) {
   const alert = findAlert(data, oblastKey, districtKey);
   if (!alert) return { state: "clear", since: null };
   return {
-    state: alert.alert_level === "yellow" ? "yellow" : "red",
-    since: alert.started_at
+    state: stateOf(alert),
+    since: alert.started_at || null
   };
 }
 
@@ -687,114 +864,205 @@ async function checkAllUsers(env) {
   const now = Date.now();
   const signature = buildStatusSignature(data);
 
+  const maint = await getMaintenance(env);
+  if (maint.active) {
+    console.log("[notify] skipped: maintenance mode is active; snapshot is not advanced");
+    return;
+  }
+
   if (!previous) {
+    const seedFailures = await notifyUsers(env, data, now, now, true);
+    if (seedFailures) {
+      console.error("[notify] initial state seed failed; not advancing snapshot yet");
+      return;
+    }
     await writeCache(env.DB, data, now, signature);
     return;
   }
 
   const changed = previous.signature !== signature;
-  const lastWriteAt = previous.fetchedAt || 0;
-  const dueForRefresh = now - lastWriteAt >= MIN_CACHE_WRITE_INTERVAL_SECONDS * 1000;
+  const lastCheckAt = previous.fetchedAt || 0;
   const retrySince = typeof previous.pendingRetry === "number" ? previous.pendingRetry : (previous.pendingRetry === true ? now : 0);
   const needsRetryPass = retrySince > 0 && now - retrySince < RETRY_WINDOW_MS;
   const retryBefore = needsRetryPass ? retrySince : 0;
 
-  if (changed || dueForRefresh) {
-    await writeCache(env.DB, data, now, signature, retryBefore);
+  let hadFailures = false;
+  if (changed || needsRetryPass) {
+    hadFailures = await notifyUsers(env, data, now, lastCheckAt);
   }
 
-  if (changed || needsRetryPass) {
-    const maint = await getMaintenance(env);
-    if (maint.active) {
-      console.log("[notify] skipped: maintenance mode is active");
-    } else {
-      const hadFailures = await notifyUsers(env, previous.data, data, now, lastWriteAt);
-      const retryAfter = hadFailures ? (retryBefore || now) : 0;
-      if (retryAfter !== retryBefore || (previous.pendingRetry && !retryBefore)) {
-        await writeCache(env.DB, data, changed || dueForRefresh ? now : (previous.fetchedAt || now), signature, retryAfter);
-      }
-    }
-  }
+  const retryAfter = hadFailures ? (retryBefore || now) : 0;
+  // Write the snapshot only after dispatch. fetchedAt doubles as the last
+  // successful upstream check, so a long outage is visible to clear-approximate
+  // messages on the next transition.
+  await writeCache(env.DB, data, now, signature, retryAfter);
 }
 
-async function deliverChange(env, job, now, lastCheckedAt) {
-  const { key, user, oldStatus, newStatus } = job;
-  let text;
+function buildTransitionText(user, location, oldStatus, newStatus, now, lastCheckedAt) {
   const m = M(user.lang);
-  const rn = escapeHtml(user.region_name);
-  if (newStatus.state === "clear") {
-    const start = oldStatus.since || user.last_alert_start;
+  const region = location.region_name || defaultLocationName(location.oblast_key, location.district_key);
+  const rn = escapeHtml(region);
+  if (newStatus.state !== "clear") return stateMessage(region, newStatus, user.lang);
 
-    const detectionGap = lastCheckedAt ? now - lastCheckedAt : Infinity;
-    const uncertain = detectionGap > DETECTION_GAP_MS;
-    if (uncertain) {
-      text = m.clearApprox
-        ? m.clearApprox(rn, start ? formatTimeKyiv(new Date(start)) : null, formatTimeKyiv(new Date(now)))
-        : m.clear(rn);
-    } else {
+  const start = oldStatus.since || null;
+  const detectionGap = lastCheckedAt ? now - lastCheckedAt : Infinity;
+  if (detectionGap > DETECTION_GAP_MS) {
+    return m.clearApprox
+      ? m.clearApprox(rn, start ? formatTimeKyiv(new Date(start)) : null, formatTimeKyiv(new Date(now)))
+      : m.clear(rn);
+  }
 
-      const startMinuteMs = start ? Math.floor(new Date(start).getTime() / 60000) * 60000 : null;
-      const nowMinuteMs = Math.floor(now / 60000) * 60000;
-      const duration = startMinuteMs !== null ? formatDuration(nowMinuteMs - startMinuteMs, user.lang) : null;
-      text = duration ? m.clearEnd(rn, formatTimeKyiv(new Date(start)), formatTimeKyiv(new Date(now)), duration) : m.clear(rn);
+  const startTs = start ? new Date(start).getTime() : NaN;
+  if (!Number.isFinite(startTs)) return m.clear(rn);
+  const startMinuteMs = Math.floor(startTs / 60000) * 60000;
+  const nowMinuteMs = Math.floor(now / 60000) * 60000;
+  const duration = formatDuration(nowMinuteMs - startMinuteMs, user.lang);
+  return duration
+    ? m.clearEnd(rn, formatTimeKyiv(new Date(start)), formatTimeKyiv(new Date(now)), duration)
+    : m.clear(rn);
+}
+
+async function deliverUserChanges(env, job, now, lastCheckedAt) {
+  const { user, changes } = job;
+  const key = `user:${user.chat_id}`;
+  const states = user.location_states && typeof user.location_states === "object"
+    ? { ...user.location_states }
+    : {};
+  let hadFailures = false;
+
+  for (const change of changes) {
+    const { location, oldStatus, newStatus } = change;
+    const locationId = locationKey(location);
+    const text = buildTransitionText(user, location, oldStatus, newStatus, now, lastCheckedAt);
+    const occurrence = newStatus.state === "clear"
+      ? (oldStatus.since || oldStatus.end || "")
+      : (newStatus.since || String(now));
+    const dedupeName = `notified:${user.chat_id}:${locationId}:${newStatus.state}:${occurrence}`;
+
+    const claimed = await tryClaimNotification(env.DB, dedupeName);
+    const res = !claimed ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
+    if (!res.ok) {
+      if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
+      console.error(`[notify] delivery failed for chat ${user.chat_id} (${locationId}), will retry`);
+      hadFailures = true;
+      continue;
     }
-  } else {
-    text = stateMessage(user.region_name, newStatus, user.lang);
+
+    if (newStatus.state === "clear") {
+      states[locationId] = {
+        state: "clear",
+        since: oldStatus.since || (states[locationId] && states[locationId].since) || null,
+        end: new Date(now).toISOString()
+      };
+    } else {
+      states[locationId] = {
+        state: newStatus.state,
+        since: newStatus.since || (states[locationId] && states[locationId].since) || new Date(now).toISOString(),
+        end: null
+      };
+    }
   }
-  const dedupeOccurrence = newStatus.state === "clear"
-    ? (oldStatus.since || user.last_alert_start || "")
-    : (newStatus.since || "");
-  const dedupeName = `notified:${user.chat_id}:${newStatus.state}:${dedupeOccurrence}`;
-  const claimed = await tryClaimNotification(env.DB, dedupeName);
-  const res = !claimed ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
-  if (!res.ok && !res.permanent) {
-    if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
-    console.error(`[notify] delivery failed for chat ${user.chat_id}, will retry`);
-    return false;
-  }
-  if (!res.ok && res.permanent) {
-    console.error(`[notify] permanent failure for chat ${user.chat_id} (HTTP ${res.status}), keeping old state and scheduling retry`);
-    if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
-    return false;
-  }
-  user.last_alert_state = newStatus.state;
-  user.last_alert_active = newStatus.state !== "clear";
-  user.last_alert_start = newStatus.state === "clear" ? null : newStatus.since;
-  user.last_alert_end = newStatus.state === "clear" ? new Date(now).toISOString() : null;
+
+  user.location_states = states;
+  applyLegacyFields(user);
   user.last_check = new Date(now).toISOString();
   try {
     await writeUser(env, key, user);
   } catch (e) {
-    console.error("[notify] could not save user state (KV write failed?):", e);
+    console.error("[notify] could not save user state:", e);
+    return false;
   }
-  return true;
+  return !hadFailures;
 }
 
-async function notifyUsers(env, previousData, data, now, lastCheckedAt) {
+async function notifyUsers(env, data, now, lastCheckedAt, seedOnly = false) {
   const jobs = [];
   const PAGE_SIZE = 500;
   let offset = 0;
-  while (true) {
-    const rows = await listUsersPage(env, offset, PAGE_SIZE);
-    if (!rows.length) break;
-    for (const row of rows) {
-      const user = rowToUser(row);
-      if (!user || !user.chat_id || !user.oblast_key) continue;
-      if (user.notify === false) continue;
-      const newStatus = alertStatus(data, user.oblast_key, user.district_key);
-      const knownState = user.last_alert_state || "clear";
-      if (knownState === newStatus.state) continue;
-      const oldStatus = alertStatus(previousData, user.oblast_key, user.district_key);
-      jobs.push({ key: `user:${user.chat_id}`, user, oldStatus, newStatus });
+  let hadFailures = false;
+
+  try {
+    while (true) {
+      const rows = await listUsersPage(env, offset, PAGE_SIZE, true);
+      if (!rows.length) break;
+      for (const row of rows) {
+        const user = rowToUser(row);
+        if (!user || !user.chat_id) continue;
+        if (user.notify === false) continue;
+
+        const locations = userLocations(user);
+        if (!locations.length) continue;
+
+        const states = user.location_states && typeof user.location_states === "object"
+          ? { ...user.location_states }
+          : {};
+        const legacy = locations.length === 1 && user.last_alert_state
+          ? { state: user.last_alert_state, since: user.last_alert_start || null, end: user.last_alert_end || null }
+          : null;
+        const changes = [];
+        let dirty = false;
+
+        for (const location of locations) {
+          const locationId = locationKey(location);
+          const newStatus = alertStatus(data, location.oblast_key, location.district_key);
+          let known = states[locationId];
+
+          if (seedOnly) {
+            states[locationId] = { state: newStatus.state, since: newStatus.since || null, end: null };
+            dirty = true;
+            continue;
+          }
+
+          if (!known || typeof known !== "object") {
+            if (legacy) {
+              known = { ...legacy };
+            } else {
+              known = { state: newStatus.state, since: newStatus.since || null, end: null };
+            }
+            states[locationId] = known;
+            dirty = true;
+          }
+
+          if ((known.state || "clear") !== newStatus.state) {
+            changes.push({
+              location,
+              oldStatus: { state: known.state || "clear", since: known.since || null, end: known.end || null },
+              newStatus
+            });
+          } else if ((known.since || null) !== (newStatus.since || null)) {
+            states[locationId] = { ...known, since: newStatus.since || known.since || null };
+            dirty = true;
+          }
+        }
+
+        user.location_states = states;
+        if (changes.length) {
+          jobs.push({ user, changes });
+        } else if (dirty) {
+          applyLegacyFields(user);
+          user.last_check = new Date(now).toISOString();
+          try {
+            await writeUser(env, `user:${user.chat_id}`, user);
+          } catch (e) {
+            console.error(`[notify] could not seed state for chat ${user.chat_id}:`, e);
+            hadFailures = true;
+          }
+        }
+      }
+      offset += rows.length;
+      if (rows.length < PAGE_SIZE) break;
     }
-    offset += rows.length;
-    if (rows.length < PAGE_SIZE) break;
+  } catch (e) {
+    console.error("[notify] could not list users:", e);
+    return true;
   }
 
-  let hadFailures = false;
   for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
     const results = await Promise.all(jobs.slice(i, i + SEND_CONCURRENCY).map(job =>
-      deliverChange(env, job, now, lastCheckedAt).catch(e => { console.error("[notify] deliver error:", e); return false; })
+      deliverUserChanges(env, job, now, lastCheckedAt).catch(e => {
+        console.error("[notify] deliver error:", e);
+        return false;
+      })
     ));
     if (results.some(ok => !ok)) hadFailures = true;
   }
@@ -803,7 +1071,9 @@ async function notifyUsers(env, previousData, data, now, lastCheckedAt) {
 
 function formatDuration(ms, lang) {
   const u = M(lang).units;
-  const seconds = Math.max(0, Math.round(ms / 1000));
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return null;
+  const seconds = Math.max(0, Math.round(value / 1000));
   const hours = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
   if (hours === 0) return `${mins} ${u.m}`;
@@ -872,7 +1142,7 @@ function normLang(v) {
 function M(lang) { return TEXTS[normLang(lang)]; }
 
 function escapeHtml(s) {
-  return String(s || "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(s || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
 function trimLen(s, n) {
@@ -948,11 +1218,16 @@ function rowToUser(row) {
     last_alert_state: row.last_alert_state,
     last_alert_active: row.last_alert_active === null || row.last_alert_active === undefined ? undefined : !!row.last_alert_active,
     last_alert_start: row.last_alert_start,
-    last_alert_end: row.last_alert_end
+    last_alert_end: row.last_alert_end,
+    locations: Array.isArray(extra.locations) ? extra.locations : [],
+    location_states: extra.location_states && typeof extra.location_states === "object" ? extra.location_states : {},
+    sessions: Array.isArray(extra.sessions) ? extra.sessions : []
   };
 }
 
 function userToRow(chatId, user) {
+  const rawUser = { ...user };
+  delete rawUser.raw;
   return [
     String(chatId),
     user.sync_token || null,
@@ -969,7 +1244,7 @@ function userToRow(chatId, user) {
     user.last_alert_active === true ? 1 : (user.last_alert_active === false ? 0 : null),
     user.last_alert_start || null,
     user.last_alert_end || null,
-    JSON.stringify(user)
+    JSON.stringify(rawUser)
   ];
 }
 
@@ -1014,12 +1289,13 @@ async function deleteUser(env, chatId) {
   }
 }
 
-async function listUsersPage(env, offset, limit) {
+async function listUsersPage(env, offset, limit, strict = false) {
   try {
     const res = await env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users ORDER BY chat_id LIMIT ?1 OFFSET ?2`).bind(limit, offset).all();
     return (res && res.results) || [];
   } catch (e) {
     console.error("[user] list error:", e);
+    if (strict) throw e;
     return [];
   }
 }
@@ -1095,7 +1371,7 @@ async function markUpdateProcessed(env, updateId) {
 }
 
 function validSyncToken(existing, token) {
-  return !!existing && !!existing.sync_token && typeof token === "string" && token === existing.sync_token;
+  return isValidToken(existing, token);
 }
 
 async function handleTelegramWebhook(request, env) {
@@ -1149,8 +1425,10 @@ async function handleTelegramWebhookInner(request, env) {
 
   if (command === "/start" && payload) {
     const dashIdx = payload.lastIndexOf("-");
-    const deviceId = dashIdx >= 0 ? payload.slice(0, dashIdx) : payload;
-    const lang = normLang(dashIdx >= 0 ? payload.slice(dashIdx + 1) : (message.from && message.from.language_code));
+    const suffix = dashIdx > 0 ? payload.slice(dashIdx + 1).toLowerCase() : "";
+    const hasLangSuffix = suffix === "uk" || suffix === "ru" || suffix === "en";
+    const deviceId = hasLangSuffix ? payload.slice(0, dashIdx) : payload;
+    const lang = normLang(hasLangSuffix ? suffix : (message.from && message.from.language_code));
 
     if (!/^[a-zA-Z0-9-]{1,64}$/.test(deviceId)) {
       await sendTelegramTracked(env, chatId, M(lang).genericStart);
@@ -1364,7 +1642,7 @@ async function buildUsersExportSQL(env, overwrite) {
 }
 
 async function collectUsers(env, data) {
-  const st = { total: 0, notifyOff: 0, noRegion: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
+  const st = { total: 0, notifyOff: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
   const PAGE_SIZE = 500;
   let offset = 0, pages = 0;
   while (true) {
@@ -1375,13 +1653,25 @@ async function collectUsers(env, data) {
       if (!u) continue;
       st.total++;
       if (u.notify === false) st.notifyOff++;
-      if (!u.oblast_key) { st.noRegion++; continue; }
+      const locations = userLocations(u);
+      if (!locations.length) { st.noRegion++; continue; }
+      if (locations.length > 1) st.multi++;
       const lang = normLang(u.lang);
       st.byLang[lang] = (st.byLang[lang] || 0) + 1;
-      const known = u.last_alert_state || "clear";
-      st.byState[known] = (st.byState[known] || 0) + 1;
-      st.byOblast[u.oblast_key] = (st.byOblast[u.oblast_key] || 0) + 1;
-      if (data && u.notify !== false && alertStatus(data, u.oblast_key, u.district_key).state !== known) st.pending++;
+      let pending = false;
+      let worst = "clear";
+      for (const location of locations) {
+        const knownState = u.location_states && u.location_states[locationKey(location)];
+        const known = knownState && knownState.state
+          ? knownState.state
+          : (locations.length === 1 ? (u.last_alert_state || "clear") : "clear");
+        if (known === "red") worst = "red";
+        else if (known === "yellow" && worst !== "red") worst = "yellow";
+        if (data && u.notify !== false && alertStatus(data, location.oblast_key, location.district_key).state !== known) pending = true;
+      }
+      st.byState[worst] = (st.byState[worst] || 0) + 1;
+      st.byOblast[locations[0].oblast_key] = (st.byOblast[locations[0].oblast_key] || 0) + 1;
+      if (pending) st.pending++;
     }
     offset += rows.length;
     if (rows.length < PAGE_SIZE) break;
@@ -1442,6 +1732,9 @@ async function handleAdmin(request, env, url) {
   }
 
   if (p === "/admin/export/users.sql" && request.method === "POST") {
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    const fails = await failCount(ip);
+    if (fails >= ADMIN_MAX_FAILS) return adminJson({ error: "too many attempts, wait 10 minutes" }, 429);
     let pw = "";
     try {
       const ct = request.headers.get("Content-Type") || "";
@@ -1449,6 +1742,7 @@ async function handleAdmin(request, env, url) {
       else pw = (await request.formData()).get("password");
     } catch (e) { }
     if (!safeEqual(String(pw || "").trim(), String(env.ADMIN_TOKEN).trim())) {
+      await bumpFail(ip, fails + 1);
       return adminJson({ error: "invalid admin token" }, 401);
     }
     const { sql, count } = await buildUsersExportSQL(env, url.searchParams.get("overwrite") === "1");
@@ -1456,13 +1750,12 @@ async function handleAdmin(request, env, url) {
     return new Response(sql, { headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Content-Disposition": 'attachment; filename="users.sql"',
-      "Access-Control-Allow-Origin": "*",
       "Cache-Control": "no-store",
       "X-Robots-Tag": "noindex"
     } });
   }
   if (!(await isAdmin(request, env))) {
-    if (p === "/admin") return loginPage("");
+    if (p === "/admin" || p === "/admin/login") return loginPage("");
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -1486,7 +1779,6 @@ async function handleAdmin(request, env, url) {
     return new Response(sql, { headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Content-Disposition": 'attachment; filename="users.sql"',
-      "Access-Control-Allow-Origin": "*",
       "Cache-Control": "no-store",
       "X-Robots-Tag": "noindex"
     } });
@@ -1517,7 +1809,7 @@ async function handleAdmin(request, env, url) {
       const cached = await readCache(env.DB);
       if (!cached || !cached.data) return adminJson({ error: "нет снапшота в D1" }, 409);
       const before = await collectUsers(env, cached.data);
-      const hadFailures = await notifyUsers(env, cached.data, cached.data, Date.now(), cached.fetchedAt);
+      const hadFailures = await notifyUsers(env, cached.data, Date.now(), cached.fetchedAt);
       const after = await collectUsers(env, cached.data);
       return adminJson({ ok: true, hadFailures, pendingBefore: before.pending, pendingAfter: after.pending });
     }
@@ -1834,7 +2126,7 @@ export default {
           ? normLang(body.lang)
           : normLang(deviceLink && deviceLink.lang || existing && existing.lang);
 
-        if (existing && existing.sync_token && !validSyncToken(existing, sync_token) && !deviceLink) {
+        if (existing && !validSyncToken(existing, sync_token) && !deviceLink) {
           return json({ error: "invalid sync token" }, 403);
         }
         if (!(await checkAndSetEphemeralFlag(`register-rate:${chat_id}`, 2))) {
@@ -1848,55 +2140,99 @@ export default {
           ? ((typeof sync_token === "string" && sync_token) || await randomToken())
           : ((existing && existing.sync_token) || (typeof sync_token === "string" && sync_token) || await randomToken());
 
-        const sameLocation = !!existing &&
-          String(existing.oblast_key || "") === String(oblast_key || "") &&
-          String(existing.district_key || "") === String(district_key || "");
+        const hasLocationsField = Object.prototype.hasOwnProperty.call(body, "locations");
+        const hasSingleField = Object.prototype.hasOwnProperty.call(body, "oblast_key");
+        let nextLocations;
+        if (hasLocationsField) {
+          const parsed = parseLocationsInput(body.locations);
+          if (parsed === null) return json({ error: "invalid locations" }, 400);
+          nextLocations = parsed;
+        } else if (hasSingleField) {
+          if (oblast_key === null || oblast_key === undefined || oblast_key === "") {
+            nextLocations = [];
+          } else {
+            const location = normalizeLocation({
+              oblast_key,
+              district_key,
+              region_name
+            });
+            if (!location) return json({ error: "unknown oblast_key or district_key" }, 400);
+            nextLocations = [location];
+          }
+        } else {
+          nextLocations = userLocations(existing);
+        }
 
+        const previousLocations = userLocations(existing);
+        const locationsChanged = !existing || JSON.stringify(previousLocations) !== JSON.stringify(nextLocations);
         const prevNotify = existing ? existing.notify !== false : true;
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
         const relinked = !!deviceLink;
-        const resync = !existing || !sameLocation || (notifyChanged && notify) || relinked;
-        const changed = !existing || !sameLocation || notifyChanged || relinked;
+        const resync = !existing || locationsChanged || (notifyChanged && notify) || relinked;
 
-        const hasLocation = !!oblast_key;
-        if (hasLocation && !OBLAST_NAMES_UK[String(oblast_key)]) return json({ error: "unknown oblast_key" }, 400);
-        if (hasLocation && district_key && !DISTRICT_NAMES_UK[String(oblast_key) + ":" + String(district_key)]) {
-          return json({ error: "unknown district_key" }, 400);
+        const snapshot = nextLocations.length ? await getSharedSnapshot(env) : null;
+        const statuses = {};
+        let firstStatus = { state: "clear", since: null };
+        for (const location of nextLocations) {
+          const status = alertStatus(snapshot && snapshot.data, location.oblast_key, location.district_key);
+          statuses[locationKey(location)] = status;
+          if (location === nextLocations[0]) firstStatus = status;
         }
-        if (!hasLocation && district_key) return json({ error: "district_key without oblast_key" }, 400);
-        const safeRegionName = hasLocation ? (trimLen(region_name, 80) || "Unknown") : null;
-        const snapshot = hasLocation ? await getSharedSnapshot(env) : null;
-        const status = hasLocation
-          ? alertStatus(snapshot.data, String(oblast_key), district_key ? String(district_key) : null)
-          : { state: "clear", since: null };
+
+        const oldStates = existing && existing.location_states && typeof existing.location_states === "object"
+          ? existing.location_states
+          : {};
+        const legacyState = existing && existing.last_alert_state
+          ? { state: existing.last_alert_state, since: existing.last_alert_start || null, end: existing.last_alert_end || null }
+          : null;
+        const locationStates = {};
+        for (const location of nextLocations) {
+          const locationId = locationKey(location);
+          const status = statuses[locationId];
+          const known = oldStates[locationId];
+          if (!known || typeof known !== "object") {
+            locationStates[locationId] = !resync && nextLocations.length === 1 && legacyState
+              ? { ...legacyState }
+              : { state: status.state, since: status.since || null, end: null };
+          } else if (resync) {
+            locationStates[locationId] = { state: status.state, since: status.since || null, end: null };
+          } else {
+            locationStates[locationId] = known;
+          }
+        }
 
         const userData = {
           chat_id: String(chat_id),
           sync_token: token,
-          oblast_key: hasLocation ? String(oblast_key) : null,
-          district_key: hasLocation && district_key ? String(district_key) : null,
-          region_name: safeRegionName,
           lang,
           notify,
           last_activity: new Date().toISOString(),
           telegram_connected: true,
           registered_at: existing && existing.registered_at ? existing.registered_at : new Date().toISOString(),
           last_check: new Date().toISOString(),
-          last_alert_state: resync ? status.state : (existing.last_alert_state || (existing.last_alert_active ? "red" : "clear")),
-          last_alert_active: resync ? status.state !== "clear" : existing.last_alert_active,
-          last_alert_start: resync ? status.since : existing.last_alert_start,
-          last_alert_end: resync ? null : existing.last_alert_end
+          locations: nextLocations,
+          location_states: locationStates,
+          sessions: normalizeSessions(existing),
+          oblast_key: existing ? existing.oblast_key : null,
+          district_key: existing ? existing.district_key : null,
+          region_name: existing ? existing.region_name : null,
+          last_alert_state: existing ? existing.last_alert_state : null,
+          last_alert_active: existing ? existing.last_alert_active : null,
+          last_alert_start: existing ? existing.last_alert_start : null,
+          last_alert_end: existing ? existing.last_alert_end : null
         };
+        addSession(userData, token, body.device_id);
+        applyLegacyFields(userData);
 
         const nothingChanged = !!existing && !relinked &&
-          String(existing.oblast_key || "") === String(userData.oblast_key || "") &&
-          String(existing.district_key || "") === String(userData.district_key || "") &&
-          String(existing.region_name || "") === String(userData.region_name || "") &&
+          JSON.stringify(previousLocations) === JSON.stringify(nextLocations) &&
           normLang(existing.lang) === userData.lang &&
           (existing.notify !== false) === notify &&
-          existing.sync_token === token;
-        if (!nothingChanged) await writeUser(env, key, userData);
+          existing.sync_token === token &&
+          JSON.stringify(normalizeSessions(existing)) === JSON.stringify(userData.sessions);
+        const changed = !nothingChanged;
+        if (changed) await writeUser(env, key, userData);
         const isNewDeviceLink = !!deviceLink;
         if (deviceLink) await deleteDeviceLink(env, body.device_id);
 
@@ -1906,10 +2242,11 @@ export default {
             await sendTelegramTracked(env, chat_id, m.connected);
           }
           if (notify) {
-            if (hasLocation && (!existing || !sameLocation || notifyChanged || relinked)) {
-              await sendTelegramTracked(env, chat_id, m.subscribed(escapeHtml(safeRegionName)));
-              await sendTelegramTracked(env, chat_id, stateMessage(region_name, status, lang));
-            } else if (!hasLocation && notifyChanged) {
+            if (nextLocations.length && resync) {
+              const label = nextLocations.map(l => l.region_name).join(", ");
+              await sendTelegramTracked(env, chat_id, m.subscribed(escapeHtml(label)));
+              await sendTelegramTracked(env, chat_id, stateMessage(nextLocations[0].region_name, firstStatus, lang));
+            } else if (!nextLocations.length && notifyChanged) {
               await sendTelegramTracked(env, chat_id, m.enabled);
             }
           } else if (notifyChanged) {
@@ -1927,13 +2264,18 @@ export default {
           changed,
           notify,
           sync_token: token,
+          locations: nextLocations,
+          oblast_key: userData.oblast_key,
+          district_key: userData.district_key,
+          region_name: userData.region_name,
+          statuses,
           status: {
-            state: hasLocation ? status.state : null,
-            active: hasLocation ? status.state !== "clear" : null,
-            since: hasLocation ? status.since : null,
+            state: nextLocations.length ? firstStatus.state : null,
+            active: nextLocations.length ? firstStatus.state !== "clear" : null,
+            since: nextLocations.length ? firstStatus.since : null,
             fetchedAt: snapshot ? snapshot.fetchedAt : null,
             lastUpstreamCheckAt: snapshot ? (snapshot.heartbeat || null) : null,
-            stale: snapshot ? (snapshot.heartbeat ? (Date.now() - snapshot.heartbeat > 180000) : true) : null
+            stale: snapshot ? (snapshot.heartbeat ? (Date.now() - snapshot.heartbeat > STALE_SNAPSHOT_MS) : true) : null
           }
         });
       } catch (e) {
@@ -1986,10 +2328,20 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    await checkAllUsers(env);
+    try {
+      await checkAllUsers(env);
+    } catch (e) {
+      console.error("[cron] checkAllUsers error:", e);
+      await recordCron(env, false, e);
+    }
     ctx.waitUntil(
       env.DB.prepare("DELETE FROM device_links WHERE expires_at < ?1").bind(Date.now()).run().catch(e => {
         console.error("[device] cleanup error:", e);
+      })
+    );
+    ctx.waitUntil(
+      env.DB.prepare("DELETE FROM notified_events WHERE created_at < ?1").bind(Date.now() - 30 * 24 * 3600 * 1000).run().catch(e => {
+        console.error("[dedupe] cleanup error:", e);
       })
     );
   }
