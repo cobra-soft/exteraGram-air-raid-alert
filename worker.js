@@ -28,15 +28,28 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.5";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.6";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
 const STALE_SNAPSHOT_MS = 35 * 60 * 1000;
 // The alarm loop polls alerts.in.ua every TICK_MS (Durable Object alarms allow
 // sub-minute scheduling; a cron trigger alone can only run once a minute).
-const TICK_MS = 8000;
+// alerts.in.ua documents a soft limit of 8-10 requests/minute per IP and a hard
+// limit of 12/minute, so the default stays at 6/minute (10 s) and the loop has
+// its own sliding-window cap. Override with the TICK_MS variable (5000-60000).
+const TICK_MS_DEFAULT = 10000;
+const TICK_MS_MIN = 5000;
+const TICK_MS_MAX = 60000;
+const TICK_WINDOW_MS = 60000;
+const TICK_MAX_PER_WINDOW = 7;
 const TICK_ERROR_BACKOFF_MS = 30000;
+
+function resolveTickMs(env) {
+  const n = Number(env && env.TICK_MS);
+  if (!Number.isFinite(n)) return TICK_MS_DEFAULT;
+  return Math.max(TICK_MS_MIN, Math.min(TICK_MS_MAX, Math.round(n)));
+}
 const MAX_LOCATIONS = 10;
 const MAX_SESSIONS = 20;
 
@@ -592,9 +605,12 @@ async function fetchUpstreamRetry(env) {
   try {
     return await fetchUpstream(env);
   } catch (e) {
-    const transient = e && (e.status === 429 || e.status >= 500 || (!e.status && !/not configured/.test(String(e.message))));
-    if (!transient || (e.retryAfterMs || 0) > 5000) throw e;
-    await new Promise(r => setTimeout(r, e.status === 429 ? (e.retryAfterMs || 2500) : 1500));
+    // Never retry a 429: that would only deepen the rate-limit violation.
+    // Let the ticker back off for a full minute (or Retry-After) instead.
+    if (e && e.status === 429) throw e;
+    const transient = e && (e.status >= 500 || (!e.status && !/not configured/.test(String(e.message))));
+    if (!transient) throw e;
+    await new Promise(r => setTimeout(r, 1500));
     return await fetchUpstream(env);
   }
 }
@@ -941,6 +957,12 @@ function stateMessage(region, status, lang) {
 }
 
 async function checkAllUsers(env) {
+  // Do not spend an upstream request while maintenance mode is on.
+  const maint = await getMaintenance(env);
+  if (maint.active) {
+    console.log("[notify] skipped: maintenance mode is active; snapshot is not advanced");
+    return;
+  }
   const previous = await readCache(env.DB);
   let data;
   try {
@@ -953,12 +975,6 @@ async function checkAllUsers(env) {
   await recordCron(env, true);
   const now = Date.now();
   const signature = buildStatusSignature(data);
-
-  const maint = await getMaintenance(env);
-  if (maint.active) {
-    console.log("[notify] skipped: maintenance mode is active; snapshot is not advanced");
-    return;
-  }
 
   if (!previous) {
     const seedFailures = await notifyUsers(env, data, now, now, true);
@@ -2241,7 +2257,7 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN, ticker: env.TICKER ? "durable" : "cron", tickMs: TICK_MS };
+      const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN, ticker: env.TICKER ? "durable" : "cron", tickMs: resolveTickMs(env) };
       try {
         const c = await readCache(env.DB);
         out.snapshot = c ? { ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000), pendingRetry: c.pendingRetry || 0 } : null;
@@ -2572,11 +2588,18 @@ export class AlertTicker {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.recent = [];
   }
 
   async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === "/now") {
+      if (this._recentCalls() >= TICK_MAX_PER_WINDOW) {
+        return new Response(JSON.stringify({ ok: false, skipped: "rate_limit_window", callsLastMinute: this.recent.length }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      this.recent.push(Date.now());
       return new Response(JSON.stringify(await this._run()), {
         headers: { "Content-Type": "application/json" }
       });
@@ -2589,14 +2612,39 @@ export class AlertTicker {
     }
     const alarm = await this.state.storage.getAlarm();
     if (alarm == null) await this.state.storage.setAlarm(Date.now() + 1000);
-    return new Response(JSON.stringify({ ok: true, alarm: await this.state.storage.getAlarm(), tickMs: TICK_MS }), {
+    return new Response(JSON.stringify({
+      ok: true,
+      alarm: await this.state.storage.getAlarm(),
+      tickMs: resolveTickMs(this.env),
+      callsLastMinute: this._recentCalls()
+    }), {
       headers: { "Content-Type": "application/json" }
     });
   }
 
+  _recentCalls() {
+    const now = Date.now();
+    this.recent = (this.recent || []).filter(t => now - t < TICK_WINDOW_MS);
+    return this.recent.length;
+  }
+
   async alarm() {
-    const res = await this._run();
-    await this.state.storage.setAlarm(Date.now() + (res.ok ? TICK_MS : TICK_ERROR_BACKOFF_MS));
+    const now = Date.now();
+    const calls = this._recentCalls();
+    let delay;
+    if (calls >= TICK_MAX_PER_WINDOW) {
+      // Sliding-window guard: never exceed the cap even if the interval was
+      // lowered too far or a manual /tick just ran.
+      delay = Math.max(1000, TICK_WINDOW_MS - (now - this.recent[0]) + 250);
+    } else {
+      this.recent.push(now);
+      const res = await this._run();
+      if (res.ok) delay = resolveTickMs(this.env);
+      else if (res.status === 403) delay = 10 * 60 * 1000;
+      else if (res.retryAfterMs) delay = Math.min(Math.max(res.retryAfterMs, 60000), 10 * 60 * 1000);
+      else delay = TICK_ERROR_BACKOFF_MS;
+    }
+    await this.state.storage.setAlarm(Date.now() + delay);
   }
 
   async _run() {
@@ -2606,7 +2654,14 @@ export class AlertTicker {
       return { ok: true, at: new Date().toISOString(), durationMs: Date.now() - started };
     } catch (e) {
       console.error("[ticker] checkAllUsers error:", e);
-      return { ok: false, at: new Date().toISOString(), durationMs: Date.now() - started, error: String(e && e.message || e).slice(0, 200) };
+      return {
+        ok: false,
+        at: new Date().toISOString(),
+        durationMs: Date.now() - started,
+        status: e && e.status ? e.status : null,
+        retryAfterMs: e && e.retryAfterMs ? e.retryAfterMs : 0,
+        error: String(e && e.message || e).slice(0, 200)
+      };
     }
   }
 }

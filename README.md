@@ -9,7 +9,7 @@ Cloudflare Worker that polls [alerts.in.ua](https://alerts.in.ua), keeps a snaps
 ## English
 
 ### What it does
-- Polls the alerts API every few seconds (Durable Object alarm loop) and stores a snapshot in D1. The minute cron only restarts that loop, so a new alert reaches Telegram in ~5–10 seconds instead of up to a minute.
+- Polls the alerts API every few seconds (Durable Object alarm loop) and stores a snapshot in D1. The minute cron only restarts that loop, so a new alert reaches Telegram in ~10 seconds instead of up to a minute.
 - Notifies Telegram users when their oblast or district changes state (red / yellow / clear).
 - Lets plugins register a location, toggle notifications, and read the current status through a public `/api` endpoint.
 - Serves a password-protected owner dashboard at `/admin`.
@@ -51,9 +51,11 @@ Check, in order:
 | Binding | Type | Purpose |
 |---|---|---|
 | `DB` | D1 | Everything the Worker stores: user records, device-link tokens, alert snapshot cache, cron status |
-| `TICKER` | Durable Object | Near-real-time poller: an alarm re-runs every `TICK_MS` (8 s) and pushes changes to Telegram |
+| `TICKER` | Durable Object | Near-real-time poller: an alarm re-runs every `TICK_MS` (10 s by default) and pushes changes to Telegram |
 
 The `TICKER` alarm is started automatically by the cron trigger (every minute it only makes sure the loop is alive). No extra setup is needed. If the binding is missing, the Worker falls back to a plain once-a-minute cron check.
+
+**Upstream limits.** alerts.in.ua documents a soft limit of 8–10 requests/minute per IP and a hard limit of 12/minute (systematic violations can block the IP and the token). The default is 6 requests/minute (10 s), and the ticker has its own sliding-window cap of 7/minute. To trade latency for headroom, set the `TICK_MS` variable in the dashboard (5000–60000 ms) — no redeploy needed. 10 s ≈ 8.6k requests/day; 20 s ≈ 4.3k; 30 s ≈ 2.9k.
 
 All persistent storage lives in this single D1 database. There is no KV namespace — an earlier version used KV for user records, but the project has fully migrated to D1 (see `MIGRATION.md`).
 
@@ -84,7 +86,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Service name |
-| GET | `/health` | Worker version, DB schema and ticker mode |
+| GET | `/health` | Worker version, DB schema, ticker mode, `tickMs` |
 | GET/POST | `/tick?key=<ADMIN_TOKEN>` | Force an immediate alert check (same as one alarm tick). Requires `ADMIN_TOKEN` or `TICK_SECRET` |
 | GET | `/api` | Current alert status (cached at the edge) |
 | POST | `/register` | Register or update a user's location and notification settings |
@@ -104,7 +106,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 ## Русский
 
 ### Что делает
-- Опрашивает API alerts.in.ua каждые несколько секунд (цикл alarm в Durable Object) и сохраняет снимок активных тревог в D1. Cron раз в минуту только перезапускает этот цикл, поэтому новая тревога приходит в Telegram за ~5–10 секунд, а не до минуты.
+- Опрашивает API alerts.in.ua каждые несколько секунд (цикл alarm в Durable Object) и сохраняет снимок активных тревог в D1. Cron раз в минуту только перезапускает этот цикл, поэтому новая тревога приходит в Telegram за ~10 секунд, а не до минуты.
 - Отправляет пользователям в Telegram уведомления, когда статус их области или района меняется (красный / жёлтый / отбой).
 - Позволяет плагинам регистрировать локацию, включать и выключать уведомления и получать текущий статус через публичный `/api`.
 - Предоставляет панель владельца на `/admin` с паролем.
@@ -146,9 +148,11 @@ The Worker does not send user data to any third party other than Telegram (to de
 | Биндинг | Тип | Назначение |
 |---|---|---|
 | `DB` | D1 | Всё, что хранит Worker: записи пользователей, токены привязки устройств, кэш снимка тревог, статус cron |
-| `TICKER` | Durable Object | Поллер почти в реальном времени: alarm повторяется каждые `TICK_MS` (8 с) и отправляет изменения в Telegram |
+| `TICKER` | Durable Object | Поллер почти в реальном времени: alarm повторяется каждые `TICK_MS` (по умолчанию 10 с) и отправляет изменения в Telegram |
 
 Цикл `TICKER` запускается автоматически cron-триггером (раз в минуту он лишь проверяет, что цикл жив). Дополнительная настройка не нужна. Если биндинга нет, Worker откатывается к обычной проверке раз в минуту.
+
+**Лимиты alerts.in.ua.** Документированы мягкий лимит 8–10 запросов/минуту с одного IP и жёсткий — 12/минуту (при систематическом нарушении блокируются IP и токен). По умолчанию — 6 запросов/минуту (10 с), плюс собственный лимит тикера 7/минуту. Чтобы выменять скорость на запас, задайте переменную `TICK_MS` в дашборде (5000–60000 мс) — без передеплоя. 10 с ≈ 8,6 тыс. запросов/сутки; 20 с ≈ 4,3 тыс.; 30 с ≈ 2,9 тыс.
 
 Всё постоянное хранилище — это одна база D1. Отдельного KV namespace нет: раньше записи пользователей хранились в KV, но проект полностью перешёл на D1 (см. `MIGRATION.md`).
 
@@ -179,7 +183,7 @@ Worker не передаёт пользовательские данные ни�
 | Метод | Путь | Описание |
 |---|---|---|
 | GET | `/` | Название сервиса |
-| GET | `/health` | Версия воркера, схема БД и режим тикера |
+| GET | `/health` | Версия воркера, схема БД, режим тикера и `tickMs` |
 | GET/POST | `/tick?key=<ADMIN_TOKEN>` | Принудительная немедленная проверка (как один тик alarm). Нужен `ADMIN_TOKEN` или `TICK_SECRET` |
 | GET | `/api` | Текущий статус тревог (кэшируется на edge) |
 | POST | `/register` | Регистрация или обновление локации и настроек уведомлений |
@@ -198,7 +202,7 @@ Worker не передаёт пользовательские данные ни�
 ## Українська
 
 ### Що робить
-- Опитує API alerts.in.ua кожні кілька секунд (цикл alarm у Durable Object) і зберігає снімок активних тривог у D1. Cron раз на хвилину лише перезапускає цей цикл, тому нова тривога надходить у Telegram за ~5–10 секунд, а не до хвилини.
+- Опитує API alerts.in.ua кожні кілька секунд (цикл alarm у Durable Object) і зберігає снімок активних тривог у D1. Cron раз на хвилину лише перезапускає цей цикл, тому нова тривога надходить у Telegram за ~10 секунд, а не до хвилини.
 - Надсилає користувачам у Telegram сповіщення, коли змінюється статус їхньої області або району (червоний / жовтий / відбій).
 - Дозволяє плагінам реєструвати локацію, вмикати й вимикати сповіщення та отримувати поточний статус через публічний `/api`.
 - Надає панель власника на `/admin` із паролем.
@@ -240,9 +244,11 @@ Worker не передаёт пользовательские данные ни�
 | Біндинг | Тип | Призначення |
 |---|---|---|
 | `DB` | D1 | Усе, що зберігає Worker: записи користувачів, токени прив'язки пристроїв, кеш снімка тривог, статус cron |
-| `TICKER` | Durable Object | Поллер майже в реальному часі: alarm повторюється кожні `TICK_MS` (8 с) і надсилає зміни в Telegram |
+| `TICKER` | Durable Object | Поллер майже в реальному часі: alarm повторюється кожні `TICK_MS` (типово 10 с) і надсилає зміни в Telegram |
 
 Цикл `TICKER` запускається автоматично cron-тригером (раз на хвилину він лише перевіряє, що цикл живий). Додаткове налаштування не потрібне. Якщо біндингу немає, Worker відкочується до звичайної перевірки раз на хвилину.
+
+**Ліміти alerts.in.ua.** Документовано м'який ліміт 8–10 запитів/хвилину з однієї IP та жорсткий — 12/хвилину (за систематичне порушення блокуються IP і токен). Типово — 6 запитів/хвилину (10 с), плюс власний ліміт тікера 7/хвилину. Щоб обміняти швидкість на запас, задайте змінну `TICK_MS` у дашборді (5000–60000 мс) — без передеплою. 10 с ≈ 8,6 тис. запитів/добу; 20 с ≈ 4,3 тис.; 30 с ≈ 2,9 тис.
 
 Усе постійне сховище — це одна база D1. Окремого KV namespace немає: раніше записи користувачів зберігалися в KV, але проєкт повністю перейшов на D1 (див. `MIGRATION.md`).
 
@@ -273,7 +279,7 @@ Worker не передає користувацькі дані нікому, к�
 | Метод | Шлях | Опис |
 |---|---|---|
 | GET | `/` | Назва сервісу |
-| GET | `/health` | Версія воркера та статус |
+| GET | `/health` | Версія воркера, схема БД, режим тікера і `tickMs` |
 | GET | `/api` | Поточний статус тривог (кешується на edge) |
 | POST | `/register` | Реєстрація або оновлення локації та налаштувань сповіщень |
 | POST | `/unregister` | Видалення користувача |
