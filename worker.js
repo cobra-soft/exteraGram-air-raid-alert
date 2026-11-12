@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.10";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.11";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -950,6 +950,27 @@ function formatTimeKyiv(date) {
   }
 }
 
+function confirmationMessage(locations, statuses, lang) {
+  const m = M(lang);
+  const label = locations.map(l => escapeHtml(l.region_name)).join(", ");
+  const header = m.subscribed(label);
+  const rows = locations.map(loc => ({
+    loc,
+    st: statuses[locationKey(loc)] || { state: "clear" }
+  }));
+  const hasAlert = rows.some(r => r.st.state === "red" || r.st.state === "yellow");
+  if (!hasAlert) return `${header}\n${m.clearAll}`;
+  const lines = rows.map(({ loc, st }) => {
+    const region = escapeHtml(loc.region_name);
+    if (st.state === "red" || st.state === "yellow") {
+      const since = formatTimeKyiv(new Date(st.since || Date.now()));
+      return st.state === "red" ? m.redInline(region, since) : m.yellowInline(region, since);
+    }
+    return m.clearInline(region);
+  });
+  return `${header}\n${lines.join("\n")}`;
+}
+
 function stateMessage(region, status, lang) {
   const m = M(lang);
   region = escapeHtml(region);
@@ -1205,6 +1226,10 @@ const TEXTS = {
     test: "⚪ Це тестове повідомлення від Air Raid Alert.",
     statusNoRegion: "⚪ Регіон ще не обрано.\nВідкрий налаштування плагіна Air Raid Alert і обери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    clearAll: "🟢 <b>Тривоги немає</b>",
+    clearInline: region => `🟢 <b>Тривоги немає</b> • ${region}`,
+    yellowInline: (region, time) => `🟡 <b>Жовтий рівень загрози</b> • ${region} • ${time}`,
+    redInline: (region, time) => `🔴 <b>Червоний рівень загрози</b> • ${region} • ${time}`,
     langChanged: name => `Мову змінено на <b>${name}</b>`,
     units: { h: "год", m: "хв" }
   },
@@ -1223,6 +1248,10 @@ const TEXTS = {
     test: "⚪ Это тестовое сообщение от Air Raid Alert.",
     statusNoRegion: "⚪ Регион ещё не выбран.\nОткрой настройки плагина Air Raid Alert и выбери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    clearAll: "🟢 <b>Тревоги нет</b>",
+    clearInline: region => `🟢 <b>Тревоги нет</b> • ${region}`,
+    yellowInline: (region, time) => `🟡 <b>Жёлтый уровень угрозы</b> • ${region} • ${time}`,
+    redInline: (region, time) => `🔴 <b>Красный уровень угрозы</b> • ${region} • ${time}`,
     langChanged: name => `Язык изменён на <b>${name}</b>`,
     units: { h: "ч", m: "мин" }
   },
@@ -1241,6 +1270,10 @@ const TEXTS = {
     test: "⚪ This is a test message from Air Raid Alert.",
     statusNoRegion: "⚪ No region selected yet.\nOpen the Air Raid Alert plugin settings and choose an oblast.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    clearAll: "🟢 <b>All clear</b>",
+    clearInline: region => `🟢 <b>All clear</b> • ${region}`,
+    yellowInline: (region, time) => `🟡 <b>Yellow threat level</b> • ${region} • ${time}`,
+    redInline: (region, time) => `🔴 <b>Red threat level</b> • ${region} • ${time}`,
     langChanged: name => `Language changed to <b>${name}</b>`,
     units: { h: "h", m: "min" }
   }
@@ -2484,14 +2517,13 @@ export default {
 
         const sendNotifications = async () => {
           const m = M(lang);
-          if (isNewDeviceLink) {
+          const confirmationFollows = !!(notify && nextLocations.length && resync);
+          if (isNewDeviceLink && !confirmationFollows) {
             await sendTelegramTracked(env, chat_id, m.connected);
           }
           if (notify) {
             if (nextLocations.length && resync) {
-              const label = nextLocations.map(l => l.region_name).join(", ");
-              await sendTelegramTracked(env, chat_id, m.subscribed(escapeHtml(label)));
-              await sendTelegramTracked(env, chat_id, stateMessage(nextLocations[0].region_name, firstStatus, lang));
+              await sendTelegramTracked(env, chat_id, confirmationMessage(nextLocations, statuses, lang));
             } else if (!nextLocations.length && notifyChanged) {
               await sendTelegramTracked(env, chat_id, m.enabled);
             } else if (langChanged) {
