@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.8";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.9";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1205,6 +1205,7 @@ const TEXTS = {
     test: "⚪ Це тестове повідомлення від Air Raid Alert.",
     statusNoRegion: "⚪ Регіон ще не обрано.\nВідкрий налаштування плагіна Air Raid Alert і обери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    langChanged: name => `Змінюю мову на <b>${name}</b>`,
     units: { h: "год", m: "хв" }
   },
   ru: {
@@ -1222,6 +1223,7 @@ const TEXTS = {
     test: "⚪ Это тестовое сообщение от Air Raid Alert.",
     statusNoRegion: "⚪ Регион ещё не выбран.\nОткрой настройки плагина Air Raid Alert и выбери область.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    langChanged: name => `Меняю язык на <b>${name}</b>`,
     units: { h: "ч", m: "мин" }
   },
   en: {
@@ -1239,9 +1241,12 @@ const TEXTS = {
     test: "⚪ This is a test message from Air Raid Alert.",
     statusNoRegion: "⚪ No region selected yet.\nOpen the Air Raid Alert plugin settings and choose an oblast.",
     statusHeader: region => `📍 <b>${region}</b>`,
+    langChanged: name => `Changing the language to <b>${name}</b>`,
     units: { h: "h", m: "min" }
   }
 };
+
+const LANG_NAMES = { uk: "Українська", ru: "Русский", en: "English" };
 
 function normLang(v) {
   const l = String(v || "").toLowerCase().slice(0, 2);
@@ -2384,7 +2389,12 @@ export default {
         }
 
         const previousLocations = userLocations(existing);
-        const locationsChanged = !existing || JSON.stringify(previousLocations) !== JSON.stringify(nextLocations);
+        // Compare only the location identity: region_name is localized, so a
+        // language switch rewrites it and must not look like a new subscription
+        // (that used to resend "Subscription active" + current status).
+        const locationSignature = list => JSON.stringify(list.map(l => [l.oblast_key, l.district_key || null]));
+        const locationsChanged = !existing || locationSignature(previousLocations) !== locationSignature(nextLocations);
+        const langChanged = !!existing && normLang(existing.lang) !== normLang(lang);
         const prevNotify = existing ? existing.notify !== false : true;
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
@@ -2484,6 +2494,8 @@ export default {
               await sendTelegramTracked(env, chat_id, stateMessage(nextLocations[0].region_name, firstStatus, lang));
             } else if (!nextLocations.length && notifyChanged) {
               await sendTelegramTracked(env, chat_id, m.enabled);
+            } else if (langChanged) {
+              await sendTelegramTracked(env, chat_id, m.langChanged(LANG_NAMES[normLang(lang)]));
             }
           } else if (notifyChanged) {
             await sendTelegramTracked(env, chat_id, m.unsubscribed);
