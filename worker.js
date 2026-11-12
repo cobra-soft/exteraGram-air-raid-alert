@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.7";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.8";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2265,6 +2265,7 @@ export default {
           const r = await env.TICKER.get(env.TICKER.idFromName("main")).fetch("https://ticker/status");
           const st = await r.json();
           out.tickerState = {
+            tickMs: st.tickMs,
             callsLastMinute: st.callsLastMinute,
             lastRunAt: st.lastRunAt,
             lastOk: st.lastOk,
@@ -2599,7 +2600,7 @@ export default {
   }
 };
 
-export class AlertTicker {
+export class AlertTickerV2 {
   constructor(state, env) {
     this.state = state;
     this.env = env;
