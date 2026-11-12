@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.14";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.15";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1163,6 +1163,59 @@ async function notifyUsers(env, data, now, lastCheckedAt, seedOnly = false) {
   return hadFailures;
 }
 
+const MAINTENANCE_TEXTS = {
+  uk: {
+    on: "🛠 <b>Технічні роботи</b>\nСповіщення про тривоги тимчасово призупинені. Про завершення повідомимо.",
+    off: "✅ <b>Технічні роботи завершено</b>\nСповіщення про тривоги знову працюють."
+  },
+  ru: {
+    on: "🛠 <b>Технические работы</b>\nРассылка уведомлений о тревогах временно приостановлена. Сообщим о завершении.",
+    off: "✅ <b>Технические работы завершены</b>\nУведомления о тревогах снова работают."
+  },
+  en: {
+    on: "🛠 <b>Maintenance in progress</b>\nAlert notifications are paused for now. We will let you know when it is over.",
+    off: "✅ <b>Maintenance finished</b>\nAlert notifications are working again."
+  }
+};
+
+async function broadcastMaintenance(env, active, customMessage) {
+  if (!env.BOT_TOKEN) {
+    console.error("[maintenance] BOT_TOKEN not set, broadcast skipped");
+    return { sent: 0, failed: 0 };
+  }
+  const custom = String(customMessage || "").trim();
+  const PAGE_SIZE = 500;
+  let offset = 0;
+  let sent = 0;
+  let failed = 0;
+  try {
+    while (true) {
+      const rows = await listUsersPage(env, offset, PAGE_SIZE, true);
+      if (!rows.length) break;
+      const jobs = [];
+      for (const row of rows) {
+        const user = rowToUser(row);
+        if (!user || !user.chat_id || user.notify === false) continue;
+        const texts = MAINTENANCE_TEXTS[normLang(user.lang)];
+        const text = (active ? texts.on : texts.off) + (active && custom ? `\n\n${escapeHtml(custom)}` : "");
+        jobs.push({ chatId: user.chat_id, text });
+      }
+      for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
+        const results = await Promise.all(jobs.slice(i, i + SEND_CONCURRENCY).map(job =>
+          sendTelegramTracked(env, job.chatId, job.text).then(r => !!(r && r.ok)).catch(() => false)
+        ));
+        for (const ok of results) ok ? sent++ : failed++;
+      }
+      offset += rows.length;
+      if (rows.length < PAGE_SIZE) break;
+    }
+  } catch (e) {
+    console.error("[maintenance] broadcast error:", e);
+  }
+  console.log(`[maintenance] broadcast ${active ? "on" : "off"}: sent=${sent} failed=${failed}`);
+  return { sent, failed };
+}
+
 function formatDuration(ms, lang) {
   const u = M(lang).units;
   const value = Number(ms);
@@ -1885,7 +1938,7 @@ async function adminData(env, request, full, kvTest, probeUp) {
   return out;
 }
 
-async function handleAdmin(request, env, url) {
+async function handleAdmin(request, env, url, ctx) {
   const p = url.pathname;
   if (!env.ADMIN_TOKEN) return new Response("Admin disabled: set the ADMIN_TOKEN secret", { status: 404 });
 
@@ -1964,11 +2017,17 @@ async function handleAdmin(request, env, url) {
         if (ct.includes("application/json")) message = (await request.json()).message;
       } catch (e) { }
       await setMaintenance(env, true, message);
-      return adminJson({ ok: true, maintenance: await getMaintenance(env) });
+      const maintenance = await getMaintenance(env);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(broadcastMaintenance(env, true, message));
+      else await broadcastMaintenance(env, true, message);
+      return adminJson({ ok: true, maintenance });
     }
     if (name === "maintenance-off") {
       await setMaintenance(env, false, null);
-      return adminJson({ ok: true, maintenance: await getMaintenance(env) });
+      const maintenance = await getMaintenance(env);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(broadcastMaintenance(env, false, null));
+      else await broadcastMaintenance(env, false, null);
+      return adminJson({ ok: true, maintenance });
     }
     if (name === "resync-notify") {
       const maint = await getMaintenance(env);
@@ -2201,7 +2260,7 @@ export default {
     }
 
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
-      return await handleAdmin(request, env, url);
+      return await handleAdmin(request, env, url, ctx);
     }
 
     if (url.pathname === "/") {
