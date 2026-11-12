@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.6";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.7";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -38,12 +38,14 @@ const STALE_SNAPSHOT_MS = 35 * 60 * 1000;
 // alerts.in.ua documents a soft limit of 8-10 requests/minute per IP and a hard
 // limit of 12/minute, so the default stays at 6/minute (10 s) and the loop has
 // its own sliding-window cap. Override with the TICK_MS variable (5000-60000).
-const TICK_MS_DEFAULT = 10000;
+const TICK_MS_DEFAULT = 15000;
 const TICK_MS_MIN = 5000;
 const TICK_MS_MAX = 60000;
+const TICK_JITTER_MS = 1500;
 const TICK_WINDOW_MS = 60000;
-const TICK_MAX_PER_WINDOW = 7;
+const TICK_MAX_PER_WINDOW = 6;
 const TICK_ERROR_BACKOFF_MS = 30000;
+const TICK_429_BACKOFF_MS = 120000;
 
 function resolveTickMs(env) {
   const n = Number(env && env.TICK_MS);
@@ -2258,6 +2260,19 @@ export default {
 
     if (url.pathname === "/health") {
       const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN, ticker: env.TICKER ? "durable" : "cron", tickMs: resolveTickMs(env) };
+      if (env.TICKER) {
+        try {
+          const r = await env.TICKER.get(env.TICKER.idFromName("main")).fetch("https://ticker/status");
+          const st = await r.json();
+          out.tickerState = {
+            callsLastMinute: st.callsLastMinute,
+            lastRunAt: st.lastRunAt,
+            lastOk: st.lastOk,
+            lastStatus: st.lastStatus,
+            last429At: st.last429At
+          };
+        } catch (e) { out.tickerState = { error: String(e && e.message || e).slice(0, 120) }; }
+      }
       try {
         const c = await readCache(env.DB);
         out.snapshot = c ? { ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000), pendingRetry: c.pendingRetry || 0 } : null;
@@ -2592,7 +2607,25 @@ export class AlertTicker {
   }
 
   async fetch(request) {
+    await this._ensureLoaded();
     const path = new URL(request.url).pathname;
+    if (path === "/status") {
+      const callsLastMinute = this._recentCalls();
+      const hourAgo = Date.now() - 3600000;
+      return new Response(JSON.stringify({
+        ok: true,
+        tickMs: resolveTickMs(this.env),
+        alarmInMs: this.alarmAt ? Math.max(0, this.alarmAt - Date.now()) : null,
+        callsLastMinute,
+        callsLastHour: this.recent.filter(t => t >= hourAgo).length,
+        lastRunAt: this.lastRunAt || null,
+        lastOk: this.lastOk === undefined ? null : this.lastOk,
+        lastStatus: this.lastStatus || null,
+        lastError: this.lastError || null,
+        last429At: this.last429At || null,
+        last429Error: this.last429Error || null
+      }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    }
     if (path === "/now") {
       if (this._recentCalls() >= TICK_MAX_PER_WINDOW) {
         return new Response(JSON.stringify({ ok: false, skipped: "rate_limit_window", callsLastMinute: this.recent.length }), {
@@ -2624,43 +2657,88 @@ export class AlertTicker {
 
   _recentCalls() {
     const now = Date.now();
-    this.recent = (this.recent || []).filter(t => now - t < TICK_WINDOW_MS);
-    return this.recent.length;
+    this.recent = (this.recent || []).filter(t => now - t < 3600000);
+    return this.recent.filter(t => now - t < TICK_WINDOW_MS).length;
+  }
+
+  async _ensureLoaded() {
+    if (this._loaded) return;
+    this._loaded = true;
+    try {
+      const saved = await this.state.storage.get("state");
+      if (saved && typeof saved === "object") {
+        this.recent = Array.isArray(saved.recent) ? saved.recent : [];
+        this.lastRunAt = saved.lastRunAt || null;
+        this.lastOk = saved.lastOk;
+        this.lastStatus = saved.lastStatus || null;
+        this.lastError = saved.lastError || null;
+        this.last429At = saved.last429At || null;
+        this.last429Error = saved.last429Error || null;
+      }
+    } catch (e) { }
+  }
+
+  async _persist() {
+    try {
+      await this.state.storage.put("state", {
+        recent: this.recent.slice(-120),
+        lastRunAt: this.lastRunAt || null,
+        lastOk: this.lastOk,
+        lastStatus: this.lastStatus || null,
+        lastError: this.lastError || null,
+        last429At: this.last429At || null,
+        last429Error: this.last429Error || null
+      });
+    } catch (e) { }
   }
 
   async alarm() {
+    await this._ensureLoaded();
     const now = Date.now();
     const calls = this._recentCalls();
     let delay;
     if (calls >= TICK_MAX_PER_WINDOW) {
       // Sliding-window guard: never exceed the cap even if the interval was
       // lowered too far or a manual /tick just ran.
-      delay = Math.max(1000, TICK_WINDOW_MS - (now - this.recent[0]) + 250);
+      const oldest = this.recent.filter(t => now - t < TICK_WINDOW_MS)[0] || now;
+      delay = Math.max(1000, TICK_WINDOW_MS - (now - oldest) + 250);
     } else {
       this.recent.push(now);
       const res = await this._run();
-      if (res.ok) delay = resolveTickMs(this.env);
+      if (res.ok) delay = resolveTickMs(this.env) + Math.floor(Math.random() * TICK_JITTER_MS);
       else if (res.status === 403) delay = 10 * 60 * 1000;
+      else if (res.status === 429) delay = Math.max(res.retryAfterMs || 0, TICK_429_BACKOFF_MS);
       else if (res.retryAfterMs) delay = Math.min(Math.max(res.retryAfterMs, 60000), 10 * 60 * 1000);
       else delay = TICK_ERROR_BACKOFF_MS;
     }
-    await this.state.storage.setAlarm(Date.now() + delay);
+    this.alarmAt = Date.now() + delay;
+    await this._persist();
+    await this.state.storage.setAlarm(this.alarmAt);
   }
 
   async _run() {
     const started = Date.now();
+    this.lastRunAt = new Date().toISOString();
     try {
       await checkAllUsers(this.env);
-      return { ok: true, at: new Date().toISOString(), durationMs: Date.now() - started };
+      this.lastOk = true; this.lastStatus = null; this.lastError = null;
+      return { ok: true, at: this.lastRunAt, durationMs: Date.now() - started };
     } catch (e) {
       console.error("[ticker] checkAllUsers error:", e);
+      this.lastOk = false;
+      this.lastStatus = e && e.status ? e.status : null;
+      this.lastError = String(e && e.message || e).slice(0, 200);
+      if (this.lastStatus === 429) {
+        this.last429At = this.lastRunAt;
+        this.last429Error = this.lastError;
+      }
       return {
         ok: false,
-        at: new Date().toISOString(),
+        at: this.lastRunAt,
         durationMs: Date.now() - started,
-        status: e && e.status ? e.status : null,
+        status: this.lastStatus,
         retryAfterMs: e && e.retryAfterMs ? e.retryAfterMs : 0,
-        error: String(e && e.message || e).slice(0, 200)
+        error: this.lastError
       };
     }
   }
