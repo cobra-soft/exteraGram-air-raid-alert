@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.11";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.12";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2432,7 +2432,8 @@ export default {
         const notify = typeof body.notify === "boolean" ? body.notify : prevNotify;
         const notifyChanged = !!existing && notify !== prevNotify;
         const relinked = !!deviceLink;
-        const resync = !existing || locationsChanged || (notifyChanged && notify) || relinked;
+        const locationsNeedSync = !existing || locationsChanged || relinked;
+        const resync = locationsNeedSync || (notifyChanged && notify);
 
         let snapshot = null;
         if (nextLocations.length) {
@@ -2517,14 +2518,16 @@ export default {
 
         const sendNotifications = async () => {
           const m = M(lang);
-          const confirmationFollows = !!(notify && nextLocations.length && resync);
+          const confirmationFollows = !!(notify && nextLocations.length && locationsNeedSync);
           if (isNewDeviceLink && !confirmationFollows) {
             await sendTelegramTracked(env, chat_id, m.connected);
           }
           if (notify) {
-            if (nextLocations.length && resync) {
+            if (nextLocations.length && locationsNeedSync) {
+              // New/changed subscription: one message with the current state.
               await sendTelegramTracked(env, chat_id, confirmationMessage(nextLocations, statuses, lang));
-            } else if (!nextLocations.length && notifyChanged) {
+            } else if (notifyChanged) {
+              // Re-enabling notifications must not look like a new subscription.
               await sendTelegramTracked(env, chat_id, m.enabled);
             } else if (langChanged) {
               await sendTelegramTracked(env, chat_id, m.langChanged(LANG_NAMES[normLang(lang)]));
