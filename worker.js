@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.13";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.14";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2162,7 +2162,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false};
  o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
-   +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена cron\\\'ом до завершения. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
+   +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена до завершения работ. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
    +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
  o+=card("Действия",'<div class="sh">Проверки</div><div class="btns"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button></div><div class="sh">Обслуживание</div><div class="btns"><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button></div><div class="sh">Рассылка и данные</div><div class="btns"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;justify-content:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
