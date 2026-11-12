@@ -13,8 +13,20 @@ d1_databases = [
   { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
+# The minute cron only acts as a watchdog: it (re)starts the Durable Object
+# alarm loop below, which runs every few seconds so alerts are pushed fast.
 [triggers]
 crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "TICKER"
+class_name = "AlertTicker"
+
+# SQLite-backed Durable Object (available on the free plan). Applied
+# automatically by `wrangler deploy` (including Workers Builds).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AlertTicker"]
 
 [vars]
 ENVIRONMENT = "production"

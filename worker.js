@@ -27,12 +27,16 @@
 const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
-const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.4";
+const EDGE_CACHE_TTL_SECONDS = 5;
+const WORKER_VERSION = "air-raid-panel-2026-11-12.5";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
 const STALE_SNAPSHOT_MS = 35 * 60 * 1000;
+// The alarm loop polls alerts.in.ua every TICK_MS (Durable Object alarms allow
+// sub-minute scheduling; a cron trigger alone can only run once a minute).
+const TICK_MS = 8000;
+const TICK_ERROR_BACKOFF_MS = 30000;
 const MAX_LOCATIONS = 10;
 const MAX_SESSIONS = 20;
 
@@ -2213,8 +2217,31 @@ export default {
       }
     }
 
+    if (url.pathname === "/tick") {
+      const key = url.searchParams.get("key") || request.headers.get("X-Tick-Key") || "";
+      const allowed = [env.TICK_SECRET, env.ADMIN_TOKEN].filter(Boolean);
+      if (!allowed.length) return json({ error: "tick disabled: set TICK_SECRET or ADMIN_TOKEN" }, 403);
+      if (!allowed.some(secret => safeEqual(String(key), String(secret)))) return json({ error: "forbidden" }, 403);
+      if (env.TICKER) {
+        try {
+          const stub = env.TICKER.get(env.TICKER.idFromName("main"));
+          const r = await stub.fetch("https://ticker/now", { method: "POST" });
+          const out = await r.json().catch(() => ({ ok: false }));
+          return json({ ok: true, ticker: out });
+        } catch (e) {
+          return json({ ok: false, error: String(e && e.message || e).slice(0, 200) }, 502);
+        }
+      }
+      try {
+        await checkAllUsers(env);
+        return json({ ok: true, ticker: "cron" });
+      } catch (e) {
+        return json({ ok: false, error: String(e && e.message || e).slice(0, 200) }, 502);
+      }
+    }
+
     if (url.pathname === "/health") {
-      const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN };
+      const out = { version: WORKER_VERSION, langs: Object.keys(TEXTS), time: new Date().toISOString(), hasAlertsKey: !!env.ALERTS_API_KEY, hasBotToken: !!env.BOT_TOKEN, ticker: env.TICKER ? "durable" : "cron", tickMs: TICK_MS };
       try {
         const c = await readCache(env.DB);
         out.snapshot = c ? { ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000), pendingRetry: c.pendingRetry || 0 } : null;
@@ -2505,11 +2532,28 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    try {
-      await checkAllUsers(env);
-    } catch (e) {
-      console.error("[cron] checkAllUsers error:", e);
-      await recordCron(env, false, e);
+    // Prefer the Durable Object alarm loop: it re-runs every few seconds, so
+    // alerts reach Telegram in seconds instead of waiting for the next
+    // one-minute cron tick. The cron stays as the watchdog that (re)starts
+    // the loop, and falls back to an inline check if the binding is missing
+    // or the DO cannot be reached.
+    let viaTicker = false;
+    if (env.TICKER) {
+      try {
+        const stub = env.TICKER.get(env.TICKER.idFromName("main"));
+        await stub.fetch("https://ticker/ensure", { method: "POST" });
+        viaTicker = true;
+      } catch (e) {
+        console.error("[ticker] ensure failed, falling back to inline check:", e);
+      }
+    }
+    if (!viaTicker) {
+      try {
+        await checkAllUsers(env);
+      } catch (e) {
+        console.error("[cron] checkAllUsers error:", e);
+        await recordCron(env, false, e);
+      }
     }
     ctx.waitUntil(
       env.DB.prepare("DELETE FROM device_links WHERE expires_at < ?1").bind(Date.now()).run().catch(e => {
@@ -2523,3 +2567,46 @@ export default {
     );
   }
 };
+
+export class AlertTicker {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/now") {
+      return new Response(JSON.stringify(await this._run()), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (path === "/stop") {
+      await this.state.storage.deleteAlarm();
+      return new Response(JSON.stringify({ ok: true, stopped: true }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const alarm = await this.state.storage.getAlarm();
+    if (alarm == null) await this.state.storage.setAlarm(Date.now() + 1000);
+    return new Response(JSON.stringify({ ok: true, alarm: await this.state.storage.getAlarm(), tickMs: TICK_MS }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  async alarm() {
+    const res = await this._run();
+    await this.state.storage.setAlarm(Date.now() + (res.ok ? TICK_MS : TICK_ERROR_BACKOFF_MS));
+  }
+
+  async _run() {
+    const started = Date.now();
+    try {
+      await checkAllUsers(this.env);
+      return { ok: true, at: new Date().toISOString(), durationMs: Date.now() - started };
+    } catch (e) {
+      console.error("[ticker] checkAllUsers error:", e);
+      return { ok: false, at: new Date().toISOString(), durationMs: Date.now() - started, error: String(e && e.message || e).slice(0, 200) };
+    }
+  }
+}

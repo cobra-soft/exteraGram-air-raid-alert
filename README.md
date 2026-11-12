@@ -9,7 +9,7 @@ Cloudflare Worker that polls [alerts.in.ua](https://alerts.in.ua), keeps a snaps
 ## English
 
 ### What it does
-- Polls the alerts API every minute (cron) and stores a snapshot in D1.
+- Polls the alerts API every few seconds (Durable Object alarm loop) and stores a snapshot in D1. The minute cron only restarts that loop, so a new alert reaches Telegram in ~5–10 seconds instead of up to a minute.
 - Notifies Telegram users when their oblast or district changes state (red / yellow / clear).
 - Lets plugins register a location, toggle notifications, and read the current status through a public `/api` endpoint.
 - Serves a password-protected owner dashboard at `/admin`.
@@ -51,6 +51,9 @@ Check, in order:
 | Binding | Type | Purpose |
 |---|---|---|
 | `DB` | D1 | Everything the Worker stores: user records, device-link tokens, alert snapshot cache, cron status |
+| `TICKER` | Durable Object | Near-real-time poller: an alarm re-runs every `TICK_MS` (8 s) and pushes changes to Telegram |
+
+The `TICKER` alarm is started automatically by the cron trigger (every minute it only makes sure the loop is alive). No extra setup is needed. If the binding is missing, the Worker falls back to a plain once-a-minute cron check.
 
 All persistent storage lives in this single D1 database. There is no KV namespace — an earlier version used KV for user records, but the project has fully migrated to D1 (see `MIGRATION.md`).
 
@@ -81,7 +84,8 @@ The Worker does not send user data to any third party other than Telegram (to de
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Service name |
-| GET | `/health` | Worker version and status |
+| GET | `/health` | Worker version, DB schema and ticker mode |
+| GET/POST | `/tick?key=<ADMIN_TOKEN>` | Force an immediate alert check (same as one alarm tick). Requires `ADMIN_TOKEN` or `TICK_SECRET` |
 | GET | `/api` | Current alert status (cached at the edge) |
 | POST | `/register` | Register or update a user's location and notification settings |
 | POST | `/unregister` | Remove a user |
@@ -100,7 +104,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 ## Русский
 
 ### Что делает
-- Раз в минуту (cron) опрашивает API alerts.in.ua и сохраняет снимок активных тревог в D1.
+- Опрашивает API alerts.in.ua каждые несколько секунд (цикл alarm в Durable Object) и сохраняет снимок активных тревог в D1. Cron раз в минуту только перезапускает этот цикл, поэтому новая тревога приходит в Telegram за ~5–10 секунд, а не до минуты.
 - Отправляет пользователям в Telegram уведомления, когда статус их области или района меняется (красный / жёлтый / отбой).
 - Позволяет плагинам регистрировать локацию, включать и выключать уведомления и получать текущий статус через публичный `/api`.
 - Предоставляет панель владельца на `/admin` с паролем.
@@ -142,6 +146,9 @@ The Worker does not send user data to any third party other than Telegram (to de
 | Биндинг | Тип | Назначение |
 |---|---|---|
 | `DB` | D1 | Всё, что хранит Worker: записи пользователей, токены привязки устройств, кэш снимка тревог, статус cron |
+| `TICKER` | Durable Object | Поллер почти в реальном времени: alarm повторяется каждые `TICK_MS` (8 с) и отправляет изменения в Telegram |
+
+Цикл `TICKER` запускается автоматически cron-триггером (раз в минуту он лишь проверяет, что цикл жив). Дополнительная настройка не нужна. Если биндинга нет, Worker откатывается к обычной проверке раз в минуту.
 
 Всё постоянное хранилище — это одна база D1. Отдельного KV namespace нет: раньше записи пользователей хранились в KV, но проект полностью перешёл на D1 (см. `MIGRATION.md`).
 
@@ -172,7 +179,8 @@ Worker не передаёт пользовательские данные ни�
 | Метод | Путь | Описание |
 |---|---|---|
 | GET | `/` | Название сервиса |
-| GET | `/health` | Версия воркера и статус |
+| GET | `/health` | Версия воркера, схема БД и режим тикера |
+| GET/POST | `/tick?key=<ADMIN_TOKEN>` | Принудительная немедленная проверка (как один тик alarm). Нужен `ADMIN_TOKEN` или `TICK_SECRET` |
 | GET | `/api` | Текущий статус тревог (кэшируется на edge) |
 | POST | `/register` | Регистрация или обновление локации и настроек уведомлений |
 | POST | `/unregister` | Удаление пользователя |
@@ -190,7 +198,7 @@ Worker не передаёт пользовательские данные ни�
 ## Українська
 
 ### Що робить
-- Раз на хвилину (cron) опитує API alerts.in.ua і зберігає снімок активних тривог у D1.
+- Опитує API alerts.in.ua кожні кілька секунд (цикл alarm у Durable Object) і зберігає снімок активних тривог у D1. Cron раз на хвилину лише перезапускає цей цикл, тому нова тривога надходить у Telegram за ~5–10 секунд, а не до хвилини.
 - Надсилає користувачам у Telegram сповіщення, коли змінюється статус їхньої області або району (червоний / жовтий / відбій).
 - Дозволяє плагінам реєструвати локацію, вмикати й вимикати сповіщення та отримувати поточний статус через публічний `/api`.
 - Надає панель власника на `/admin` із паролем.
@@ -232,6 +240,9 @@ Worker не передаёт пользовательские данные ни�
 | Біндинг | Тип | Призначення |
 |---|---|---|
 | `DB` | D1 | Усе, що зберігає Worker: записи користувачів, токени прив'язки пристроїв, кеш снімка тривог, статус cron |
+| `TICKER` | Durable Object | Поллер майже в реальному часі: alarm повторюється кожні `TICK_MS` (8 с) і надсилає зміни в Telegram |
+
+Цикл `TICKER` запускається автоматично cron-тригером (раз на хвилину він лише перевіряє, що цикл живий). Додаткове налаштування не потрібне. Якщо біндингу немає, Worker відкочується до звичайної перевірки раз на хвилину.
 
 Усе постійне сховище — це одна база D1. Окремого KV namespace немає: раніше записи користувачів зберігалися в KV, але проєкт повністю перейшов на D1 (див. `MIGRATION.md`).
 
