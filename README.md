@@ -305,18 +305,20 @@ Only used for Git-based deploys (Workers Builds). The file itself is comment-fre
 
 ## Schema (SQL)
 
+### English
+
 One-time D1 setup. After deploying you can instead open `/admin` → *Инициализировать D1*: the Worker runs the same DDL itself. The script is idempotent, so re-running it is safe.
 
 ```sql
--- Air Raid Alert — полная схема D1 для текущего worker.js.
--- Выполнить один раз в Cloudflare Dashboard → D1 → ваша база → Console.
--- Скрипт идемпотентный: повторный запуск безопасен.
+-- Air Raid Alert — full D1 schema for the current worker.js.
+-- Run once in Cloudflare Dashboard → D1 → your database → Console.
+-- The script is idempotent: re-running it is safe.
 --
--- Без таблицы device_links не работает «вход» плагина: Telegram /start не
--- может сохранить связку устройство → чат, и новый пользователь никогда не
--- попадает в users.
+-- Without the device_links table the plugin cannot "log in": Telegram /start
+-- cannot save the device → chat link, and a new user never reaches users.
 
--- 1. Пользователи.
+-- 1. Users.
+
 CREATE TABLE IF NOT EXISTS users (
   chat_id            TEXT PRIMARY KEY,
   sync_token         TEXT,
@@ -336,10 +338,86 @@ CREATE TABLE IF NOT EXISTS users (
   raw                TEXT
 );
 
+-- 2. Alert snapshot cache, cron state and maintenance flag.
 CREATE INDEX IF NOT EXISTS idx_users_active ON users (oblast_key, district_key);
 CREATE INDEX IF NOT EXISTS idx_users_notify ON users (notify);
 
+CREATE TABLE IF NOT EXISTS cache_kv (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at INTEGER
+);
+
+-- 3. Notification deduplication.
+CREATE TABLE IF NOT EXISTS notified_events (
+  dedupe_key TEXT PRIMARY KEY,
+  created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_notified_events_created ON notified_events (created_at);
+
+-- 4. Plugin install ↔ Telegram chat link (/start flow).
+CREATE TABLE IF NOT EXISTS device_links (
+  device_id    TEXT PRIMARY KEY,
+  chat_id      TEXT NOT NULL,
+  lang         TEXT,
+  sync_token   TEXT,
+  connected_at TEXT,
+  expires_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_links_expires ON device_links (expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
+
+-- Verify after running:
+--   SELECT name FROM sqlite_master WHERE type = 'table';
+--   SELECT COUNT(*) AS total FROM users;
+--
+-- If the users table already existed with an older schema and is missing
+-- columns, the Worker's INSERT will fail. Check the columns:
+--   PRAGMA table_info(users);
+-- Add the missing columns manually, for example:
+--   ALTER TABLE users ADD COLUMN raw TEXT;
+```
+
+### Русский
+
+Разовая настройка D1. После деплоя можно вместо этого открыть `/admin` → *Инициализировать D1*: воркер выполнит тот же DDL сам. Скрипт идемпотентный, повторный запуск безопасен.
+
+```sql
+-- Air Raid Alert — полная схема D1 для текущего worker.js.
+-- Выполнить один раз в Cloudflare Dashboard → D1 → ваша база → Console.
+-- Скрипт идемпотентный: повторный запуск безопасен.
+--
+-- Без таблицы device_links не работает «вход» плагина: Telegram /start не
+-- может сохранить связку устройство → чат, и новый пользователь никогда не
+-- попадает в users.
+
+-- 1. Пользователи.
+
+CREATE TABLE IF NOT EXISTS users (
+  chat_id            TEXT PRIMARY KEY,
+  sync_token         TEXT,
+  oblast_key         TEXT,
+  district_key       TEXT,
+  region_name        TEXT,
+  lang               TEXT,
+  notify             INTEGER DEFAULT 1,
+  telegram_connected INTEGER DEFAULT 0,
+  registered_at      TEXT,
+  last_activity      TEXT,
+  last_check         TEXT,
+  last_alert_state   TEXT,
+  last_alert_active  INTEGER,
+  last_alert_start   TEXT,
+  last_alert_end     TEXT,
+  raw                TEXT
+);
+
 -- 2. Кэш снимка тревог, состояние cron и тех.работ.
+CREATE INDEX IF NOT EXISTS idx_users_active ON users (oblast_key, district_key);
+CREATE INDEX IF NOT EXISTS idx_users_notify ON users (notify);
+
 CREATE TABLE IF NOT EXISTS cache_kv (
   key        TEXT PRIMARY KEY,
   value      TEXT,
@@ -375,6 +453,82 @@ CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
 -- колонок, INSERT из воркера будет падать. Проверить колонки:
 --   PRAGMA table_info(users);
 -- Недостающие колонки добавить вручную, например:
+--   ALTER TABLE users ADD COLUMN raw TEXT;
+```
+
+### Українська
+
+Одноразове налаштування D1. Після деплою можна натомість відкрити `/admin` → *Ініціалізувати D1*: воркер виконає той самий DDL сам. Скрипт ідемпотентний, повторний запуск безпечний.
+
+```sql
+-- Air Raid Alert — повна схема D1 для поточного worker.js.
+-- Виконати один раз у Cloudflare Dashboard → D1 → ваша база → Console.
+-- Скрипт ідемпотентний: повторний запуск безпечний.
+--
+-- Без таблиці device_links не працює «вхід» плагіна: Telegram /start не
+-- може зберегти зв'язку пристрій → чат, і новий користувач ніколи не
+-- потрапляє в users.
+
+-- 1. Користувачі.
+
+CREATE TABLE IF NOT EXISTS users (
+  chat_id            TEXT PRIMARY KEY,
+  sync_token         TEXT,
+  oblast_key         TEXT,
+  district_key       TEXT,
+  region_name        TEXT,
+  lang               TEXT,
+  notify             INTEGER DEFAULT 1,
+  telegram_connected INTEGER DEFAULT 0,
+  registered_at      TEXT,
+  last_activity      TEXT,
+  last_check         TEXT,
+  last_alert_state   TEXT,
+  last_alert_active  INTEGER,
+  last_alert_start   TEXT,
+  last_alert_end     TEXT,
+  raw                TEXT
+);
+
+-- 2. Кеш знімка тривог, стан cron і тех.робіт.
+CREATE INDEX IF NOT EXISTS idx_users_active ON users (oblast_key, district_key);
+CREATE INDEX IF NOT EXISTS idx_users_notify ON users (notify);
+
+CREATE TABLE IF NOT EXISTS cache_kv (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at INTEGER
+);
+
+-- 3. Дедуплікація сповіщень.
+CREATE TABLE IF NOT EXISTS notified_events (
+  dedupe_key TEXT PRIMARY KEY,
+  created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_notified_events_created ON notified_events (created_at);
+
+-- 4. Зв'язка встановлення плагіна з Telegram-чатом (сценарій /start).
+CREATE TABLE IF NOT EXISTS device_links (
+  device_id    TEXT PRIMARY KEY,
+  chat_id      TEXT NOT NULL,
+  lang         TEXT,
+  sync_token   TEXT,
+  connected_at TEXT,
+  expires_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_links_expires ON device_links (expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
+
+-- Перевірка після виконання:
+--   SELECT name FROM sqlite_master WHERE type = 'table';
+--   SELECT COUNT(*) AS total FROM users;
+--
+-- Якщо таблиця users вже існувала у старій схемі і в ній бракує
+-- колонок, INSERT із воркера падатиме. Перевірити колонки:
+--   PRAGMA table_info(users);
+-- Відсутні колонки додати вручну, наприклад:
 --   ALTER TABLE users ADD COLUMN raw TEXT;
 ```
 
