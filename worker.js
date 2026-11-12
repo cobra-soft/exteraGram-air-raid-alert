@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.3";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.4";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2384,9 +2384,9 @@ export default {
           locations: nextLocations,
           location_states: locationStates,
           sessions: normalizeSessions(existing),
-          oblast_key: existing ? existing.oblast_key : null,
-          district_key: existing ? existing.district_key : null,
-          region_name: existing ? existing.region_name : null,
+          oblast_key: nextLocations[0] ? nextLocations[0].oblast_key : null,
+          district_key: nextLocations[0] ? nextLocations[0].district_key : null,
+          region_name: nextLocations[0] ? nextLocations[0].region_name : null,
           last_alert_state: existing ? existing.last_alert_state : null,
           last_alert_active: existing ? existing.last_alert_active : null,
           last_alert_start: existing ? existing.last_alert_start : null,
