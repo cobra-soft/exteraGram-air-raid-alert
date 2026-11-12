@@ -5,10 +5,12 @@ keep_vars = true
 
 # keep_vars = true обязателен при деплое из GitHub:
 # без него wrangler может затереть переменные и секреты, заданные в Dashboard
-# (BOT_TOKEN, ALERTS_API_KEY, ADMIN_TOKEN).
+# (BOT_TOKEN, ALERTS_API_KEY, ADMIN_TOKEN, WEBHOOK_SECRET).
+#
+# database_name — только читаемая метка; авторитетен database_id.
 
 d1_databases = [
-  { binding = "DB", database_name = "wrangler_d1", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
+  { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
 [triggers]

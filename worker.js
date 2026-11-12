@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-10-01";
+const WORKER_VERSION = "air-raid-panel-2026-11-12";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -258,6 +258,52 @@ async function d1PutKV(db, key, value) {
   } catch (e) {
     console.error(`[d1] write error for ${key}:`, e);
   }
+}
+
+const REQUIRED_TABLES = {
+  users: ["chat_id", "sync_token", "oblast_key", "district_key", "region_name", "lang", "notify",
+    "telegram_connected", "registered_at", "last_activity", "last_check", "last_alert_state",
+    "last_alert_active", "last_alert_start", "last_alert_end", "raw"],
+  cache_kv: ["key", "value", "updated_at"],
+  notified_events: ["dedupe_key", "created_at"],
+  device_links: ["device_id", "chat_id", "lang", "sync_token", "connected_at", "expires_at"]
+};
+
+async function checkSchema(db) {
+  const out = { ok: true, tables: {}, missing: [], badColumns: [], error: null };
+  for (const [table, columns] of Object.entries(REQUIRED_TABLES)) {
+    try {
+      let names;
+      try {
+        const res = await db.prepare(`PRAGMA table_info(${table})`).all();
+        names = ((res && res.results) || []).map(r => r && r.name).filter(Boolean);
+      } catch (pragmaErr) {
+        const res = await db.prepare("SELECT name FROM pragma_table_info(?1)").bind(table).all();
+        names = ((res && res.results) || []).map(r => r && r.name).filter(Boolean);
+      }
+      const have = new Set(names);
+      if (!have.size) {
+        out.tables[table] = "missing";
+        out.missing.push(table);
+        out.ok = false;
+        continue;
+      }
+      const lack = columns.filter(c => !have.has(c));
+      if (lack.length) {
+        out.tables[table] = "bad-columns";
+        out.badColumns.push({ table, columns: lack });
+        out.ok = false;
+      } else {
+        out.tables[table] = "ok";
+      }
+    } catch (e) {
+      out.tables[table] = "error";
+      out.missing.push(table);
+      out.ok = false;
+      out.error = String(e && e.message || e).slice(0, 200);
+    }
+  }
+  return out;
 }
 
 async function tryClaimNotification(db, dedupeKey) {
@@ -1250,7 +1296,7 @@ function userToRow(chatId, user) {
   ];
 }
 
-async function readUser(env, key) {
+async function readUser(env, key, strict = false) {
   const chatId = keyToChatId(key);
   if (!chatId) return null;
   try {
@@ -1258,6 +1304,7 @@ async function readUser(env, key) {
     return rowToUser(row);
   } catch (e) {
     console.error(`[user] read error for ${key}:`, e);
+    if (strict) throw e;
     return null;
   }
 }
@@ -1344,13 +1391,21 @@ async function randomToken() {
 }
 
 async function checkAndSetEphemeralFlag(name, ttlSeconds) {
-  const url = `https://ephemeral-flags.internal/${encodeURIComponent(name)}`;
-  const key = new Request(url);
-  const existing = await caches.default.match(key);
-  if (existing) return false;
-  const resp = new Response("1", { headers: { "Cache-Control": `max-age=${ttlSeconds}` } });
-  await caches.default.put(key, resp);
-  return true;
+  // Fail-open: a cache failure must never block webhook processing or
+  // registration. Worst case a rate limit is not applied or an update is
+  // processed twice; both are harmless compared with dropping the update.
+  try {
+    const url = `https://ephemeral-flags.internal/${encodeURIComponent(name)}`;
+    const key = new Request(url);
+    const existing = await caches.default.match(key);
+    if (existing) return false;
+    const resp = new Response("1", { headers: { "Cache-Control": `max-age=${ttlSeconds}` } });
+    await caches.default.put(key, resp);
+    return true;
+  } catch (e) {
+    console.error(`[flags] cache unavailable for ${name}:`, e);
+    return true;
+  }
 }
 
 async function hasEphemeralFlag(name) {
@@ -1376,20 +1431,80 @@ function validSyncToken(existing, token) {
   return isValidToken(existing, token);
 }
 
-async function handleTelegramWebhook(request, env) {
+const WEBHOOK_SECRET_KEY = "webhook-secret";
+
+async function getWebhookSecret(env) {
+  if (env.WEBHOOK_SECRET) return String(env.WEBHOOK_SECRET);
   try {
-    return await handleTelegramWebhookInner(request, env);
+    const row = await env.DB.prepare("SELECT value FROM cache_kv WHERE key = ?1").bind(WEBHOOK_SECRET_KEY).first();
+    if (row && row.value) return String(row.value);
+    const secret = await randomToken();
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO cache_kv (key, value, updated_at) VALUES (?1, ?2, ?3)"
+    ).bind(WEBHOOK_SECRET_KEY, secret, Date.now()).run();
+    const stored = await env.DB.prepare("SELECT value FROM cache_kv WHERE key = ?1").bind(WEBHOOK_SECRET_KEY).first();
+    return stored && stored.value ? String(stored.value) : secret;
+  } catch (e) {
+    console.error("[webhook] secret storage unavailable, registering webhook without secret:", e);
+    return null;
+  }
+}
+
+function telegramWebhookUrl(request) {
+  const target = new URL(request.url);
+  target.pathname = "/telegram/webhook";
+  target.search = "";
+  return target.toString();
+}
+
+async function registerTelegramWebhook(env, webhookUrl, dropPending = false) {
+  if (!env.BOT_TOKEN) return { ok: false, error: "BOT_TOKEN not configured" };
+  const secret = await getWebhookSecret(env);
+  const setUrl = new URL(`${TELEGRAM_API}${env.BOT_TOKEN}/setWebhook`);
+  setUrl.searchParams.set("url", webhookUrl);
+  setUrl.searchParams.set("allowed_updates", JSON.stringify(["message", "callback_query"]));
+  if (dropPending) setUrl.searchParams.set("drop_pending_updates", "true");
+  if (secret) setUrl.searchParams.set("secret_token", secret);
+  const r = await fetchWithTimeout(setUrl.toString(), {}, FETCH_TIMEOUT_MS);
+  let body = null;
+  try { body = await r.json(); } catch (e) { }
+  const ok = !!(r.ok && body && body.ok);
+  console.log(`[webhook] setWebhook ${ok ? "ok" : "failed"} url=${webhookUrl} secret=${secret ? "yes" : "no"}`);
+  return { ok, secretConfigured: !!secret, webhook_url: webhookUrl, status: r.status, telegram_response: body };
+}
+
+async function repairWebhook(request, env) {
+  if (!(await checkAndSetEphemeralFlag("webhook-repair", 60))) return;
+  try {
+    await registerTelegramWebhook(env, telegramWebhookUrl(request), false);
+  } catch (e) {
+    console.error("[webhook] self-repair failed:", e);
+  }
+}
+
+async function handleTelegramWebhook(request, env, ctx = null) {
+  try {
+    return await handleTelegramWebhookInner(request, env, ctx);
   } catch (e) {
     console.error("[webhook] handler error:", e);
     return json({ ok: true, error: "logged" });
   }
 }
 
-async function handleTelegramWebhookInner(request, env) {
-  if (env.WEBHOOK_SECRET) {
+async function handleTelegramWebhookInner(request, env, ctx = null) {
+  const expectedSecret = await getWebhookSecret(env);
+  if (expectedSecret) {
     const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-    if (!safeEqual(got, env.WEBHOOK_SECRET)) {
-      return json({ ok: false }, 401);
+    if (!safeEqual(got, expectedSecret)) {
+      // The worker requires a secret but Telegram delivered the update without
+      // it (the webhook was registered by an older build, or with another
+      // value). Re-register the webhook with the correct secret in the
+      // background and let Telegram retry; otherwise /start never arrives and
+      // every new user is stuck at "missing device link".
+      const task = repairWebhook(request, env);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+      else await task;
+      return json({ ok: false, error: "invalid webhook secret", auto_repair: true }, 401);
     }
   }
 
@@ -1477,22 +1592,12 @@ async function handleSetupWebhook(request, env) {
   if (!env.BOT_TOKEN) {
     return json({ ok: false, error: "BOT_TOKEN not configured" }, 500);
   }
-  if (!env.WEBHOOK_SECRET) {
-    return json({ ok: false, error: "WEBHOOK_SECRET not configured" }, 500);
+  try {
+    const result = await registerTelegramWebhook(env, telegramWebhookUrl(request), true);
+    return json(result);
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 502);
   }
-  const target = new URL(request.url);
-  target.pathname = "/telegram/webhook";
-  target.search = "";
-
-  const setUrl = new URL(`${TELEGRAM_API}${env.BOT_TOKEN}/setWebhook`);
-  setUrl.searchParams.set("url", target.toString());
-  setUrl.searchParams.set("allowed_updates", JSON.stringify(["message", "callback_query"]));
-  setUrl.searchParams.set("drop_pending_updates", "true");
-  setUrl.searchParams.set("secret_token", env.WEBHOOK_SECRET);
-
-  const r = await fetchWithTimeout(setUrl.toString(), {}, FETCH_TIMEOUT_MS);
-  const body = await r.json();
-  return json({ ok: r.ok, webhook_url: target.toString(), telegram_response: body });
 }
 
 function safeEqual(a, b) {
@@ -1648,12 +1753,12 @@ async function buildUsersExportSQL(env, overwrite) {
   return { sql: lines.join("\n"), count };
 }
 
-async function collectUsers(env, data) {
+async function collectUsers(env, data, strict = false) {
   const st = { total: 0, notifyOff: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
   const PAGE_SIZE = 500;
   let offset = 0, pages = 0;
   while (true) {
-    const rows = await listUsersPage(env, offset, PAGE_SIZE);
+    const rows = await listUsersPage(env, offset, PAGE_SIZE, strict);
     if (!rows.length) break;
     for (const row of rows) {
       const u = rowToUser(row);
@@ -1698,6 +1803,7 @@ async function adminData(env, request, full, kvTest, probeUp) {
   const c = await readCache(env.DB);
   try { const cronRaw = await d1GetKV(env.DB, CRON_STATUS_KEY); out.cron = cronRaw ? JSON.parse(cronRaw) : null; } catch (e) { out.cron = null; }
   out.maintenance = await getMaintenance(env);
+  out.dbSchema = await checkSchema(env.DB);
   out.snapshot = c ? {
     fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
     pendingRetry: c.pendingRetry || 0, signature: c.signature,
@@ -1718,7 +1824,7 @@ async function adminData(env, request, full, kvTest, probeUp) {
       const j = await r.json();
       return { info: j.result || j };
     }),
-    timed(async () => ({ stats: await collectUsers(env, c && c.data) })),
+    timed(async () => ({ stats: await collectUsers(env, c && c.data, true) })),
     kvTest ? timed(async () => { await d1PutKV(env.DB, "health-check", String(Date.now())); return {}; }) : Promise.resolve(null)
   ]);
   for (const x of [up, wh, users, kv]) if (x) { x.ms = Date.now() - x._t; delete x._t; }
@@ -1829,11 +1935,11 @@ const ADMIN_HTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#141218">
 <title>Air Raid Worker</title>
 <style>
-:root{--f:"Roboto","system-ui",-apple-system,"Segoe UI",sans-serif;--app-bg:linear-gradient(135deg,#0284c7 0%,#2563eb 45%,#4f46e5 100%);--pr:#3b82f6;--prc:#1d4ed8;--onpr:#ffffff;--cy:#22d3ee;--cyc:#0891b2;--oncy:#002230;--surf:rgba(15,23,42,0.66);--surf2:rgba(255,255,255,0.05);--s3:rgba(255,255,255,0.08);--tx:#f1f5f9;--tv:#94a3b8;--ol:rgba(255,255,255,0.14);--olv:rgba(255,255,255,0.07);--ok:#4ade80;--okc:#14532d;--warn:#fbbf24;--warnc:#713f12;--err:#f87171;--errc:#7f1d1d}
+:root{--f:"Roboto","system-ui",-apple-system,"Segoe UI",sans-serif;--app-surface:rgba(15,23,42,0.9);--app-bg:linear-gradient(135deg,#0284c7 0%,#2563eb 45%,#4f46e5 100%);--pr:#3b82f6;--prc:#1d4ed8;--onpr:#ffffff;--cy:#22d3ee;--cyc:#0891b2;--oncy:#002230;--surf:rgba(15,23,42,0.66);--surf2:rgba(255,255,255,0.05);--s3:rgba(255,255,255,0.08);--tx:#f1f5f9;--tv:#94a3b8;--ol:rgba(255,255,255,0.14);--olv:rgba(255,255,255,0.07);--ok:#4ade80;--okc:#14532d;--warn:#fbbf24;--warnc:#713f12;--err:#f87171;--errc:#7f1d1d}
 *,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--app-bg);background-attachment:fixed;color:var(--tx);font:400 14px/20px Roboto,system-ui,-apple-system,"Segoe UI",sans-serif}
-.app{display:flex;min-height:100vh;background:transparent}
-.rail{width:88px;flex:none;position:sticky;top:0;height:100vh;background:var(--surf);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);display:flex;flex-direction:column;align-items:center;padding:20px 0;gap:14px;border-right:1px solid var(--ol)}
+.app{display:flex;min-height:100vh;background:var(--app-surface);padding:20px;gap:0}
+.rail{width:88px;flex:none;position:sticky;top:0;height:100vh;background:var(--app-surface);border-right:1px solid var(--ol);display:flex;flex-direction:column;align-items:center;padding:20px 0;gap:14px}
 .ni{display:flex;flex-direction:column;align-items:center;gap:4px;font:500 12px/16px var(--f);color:var(--tv);border:0;background:none;cursor:pointer;width:80px;padding:0}
 .ni .pill{width:56px;height:32px;border-radius:16px;display:grid;place-items:center;transition:background .2s}
 .ni:hover .pill{background:var(--s3)}.ni.on{color:var(--tx)}.ni.on .pill{background:linear-gradient(135deg,var(--pr),var(--cy));color:#ffffff}
@@ -1852,14 +1958,14 @@ body{margin:0;background:var(--app-bg);background-attachment:fixed;color:var(--t
 .sw i:after{content:"";position:absolute;top:6px;left:6px;width:16px;height:16px;border-radius:50%;background:var(--ol);transition:.2s}
 .sw.on i{background:var(--pr);border-color:var(--pr)}.sw.on i:after{left:22px;top:2px;width:24px;height:24px;background:var(--onpr)}
 .view{padding:8px 16px 120px;max-width:1000px;margin:0 auto;display:grid;gap:12px}
-.card{background:var(--surf2);border:1px solid var(--ol);border-radius:20px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,0.35)}
+.card{background:var(--app-surface);border:1px solid var(--ol);border-radius:20px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,0.45)}
 .card h2{margin:0 0 8px;font:500 14px/20px var(--f);color:var(--pr);letter-spacing:.1px}
 .hero{border-radius:28px;padding:24px;display:flex;gap:16px;align-items:center}
 .hero.ok{background:linear-gradient(135deg,#16653a,#047857);color:#ffffff}.hero.warn{background:linear-gradient(135deg,#713f12,#b45309);color:#ffffff}.hero.bad{background:linear-gradient(135deg,#7f1d1d,#991b1b);color:#ffffff}
 .hero .ic{width:56px;height:56px;border-radius:28px;background:rgba(255,255,255,.12);display:grid;place-items:center;font-size:28px;flex:none}
 .hero b{display:block;font:400 24px/32px var(--f)}.hero span{opacity:.85}
 .metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
-.m{background:var(--surf2);border-radius:16px;padding:16px}.m .v{font:400 32px/40px var(--f);color:var(--tx)}.m .l{color:var(--tv);font-size:12px}
+.m{background:rgba(15,23,42,0.6);border-radius:16px;padding:16px}.m .v{font:400 32px/40px var(--f);color:var(--tx)}.m .l{color:var(--tv);font-size:12px}
 .m.hl{background:var(--s3)}.m.hl .v{color:var(--tx)}
 .li{display:flex;align-items:center;gap:16px;padding:10px 0;border-bottom:1px solid var(--olv);cursor:default}
 .li:last-child{border:0}.li .av{width:40px;height:40px;border-radius:20px;background:var(--s3);color:var(--tx);display:grid;place-items:center;flex:none;font-size:18px}
@@ -1885,7 +1991,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospa
 .fab{position:fixed;right:16px;bottom:24px;height:56px;padding:0 20px 0 16px;border-radius:16px;border:0;background:linear-gradient(135deg,var(--pr),var(--cy));color:#ffffff;font:600 14px var(--f);display:flex;align-items:center;gap:12px;cursor:pointer;box-shadow:0 8px 24px rgba(59,130,246,0.4);z-index:6}
 .fab svg{width:24px;height:24px;fill:currentColor}
 .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;place-items:center;z-index:20}.scrim.on{display:grid}
-.dlg{background:var(--s3);border-radius:28px;padding:24px;width:min(360px,calc(100% - 32px))}.dlg h3{margin:0 0 16px;font:400 24px/32px var(--f)}.dlg p{margin:0 0 24px;color:var(--tv)}.dlg .row{justify-content:flex-end}
+.dlg{background:var(--app-surface);border:1px solid var(--ol);border-radius:28px;padding:24px;width:min(360px,calc(100% - 32px))}.dlg h3{margin:0 0 16px;font:400 24px/32px var(--f)}.dlg p{margin:0 0 24px;color:var(--tv)}.dlg .row{justify-content:flex-end}
 .snack{position:fixed;left:50%;transform:translate(-50%,16px);opacity:0;visibility:hidden;pointer-events:none;bottom:96px;background:#e6e0e9;color:#322f35;padding:14px 16px;border-radius:12px;max-width:calc(100% - 32px);z-index:30;box-shadow:0 4px 12px rgba(0,0,0,.4);transition:transform .3s cubic-bezier(.2,0,0,1),opacity .3s ease,visibility 0s .3s}
 .snack.on{transform:translate(-50%,0);opacity:1;visibility:visible;transition:transform .3s cubic-bezier(.2,0,0,1),opacity .3s ease,visibility 0s}
 .tag.green{background:var(--okc);color:var(--ok)}
@@ -1894,7 +2000,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospa
 .mi{display:flex;gap:12px;padding:12px 16px;cursor:pointer}.mi:hover{background:var(--s3)}.mi span{width:16px;color:var(--pr)}.mi.on{color:var(--pr)}
 @media(max-width:600px){.menu{position:fixed;left:16px;right:16px;top:auto;bottom:100px;min-width:0}}
 @media(min-width:840px){.metrics{grid-template-columns:repeat(4,1fr)}.fab{bottom:24px}.snack{bottom:24px}}
-@media(max-width:839px){.rail{position:fixed;bottom:0;left:0;right:0;top:auto;width:100%;height:80px;flex-direction:row;justify-content:space-around;padding:12px 0 calc(12px + env(safe-area-inset-bottom,0px));background:var(--surf2);border:0;z-index:10;height:auto}
+@media(max-width:839px){.rail{position:fixed;bottom:0;left:0;right:0;top:auto;width:100%;height:80px;flex-direction:row;justify-content:space-around;padding:12px 0 calc(12px + env(safe-area-inset-bottom,0px));background:var(--app-surface);border:0;z-index:10;height:auto}
 .fab{bottom:96px;right:16px;width:56px;padding:0;justify-content:center}.fab span{display:none}.snack{bottom:170px}.sw b{display:none}}
 </style></head><body>
 <div class="app">
@@ -1926,8 +2032,9 @@ function tab(t){S.tab=t;nav();draw();scrollTo(0,0)}
 function whErr(w){var i=w&&w.ok&&w.info;return i&&i.last_error_message&&i.last_error_date&&(Date.now()/1000-i.last_error_date)<3600?i.last_error_message:""}
 function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  function bad(m){is.push(m);lvl="bad"}function wr(m){is.push(m);if(lvl!=="bad")lvl="warn"}
- if(!d.bindings.alertsKey)bad("Нет ALERTS_API_KEY");if(!d.bindings.botToken)bad("Нет BOT_TOKEN");
- if(!d.snapshot)bad("Нет снапшота");else if(d.snapshot.ageSeconds>2100)bad("Снапшот устарел ("+age(d.snapshot.ageSeconds)+")");
+  if(!d.bindings.alertsKey)bad("Нет ALERTS_API_KEY");if(!d.bindings.botToken)bad("Нет BOT_TOKEN");
+  if(d.dbSchema&&!d.dbSchema.ok)bad("D1: "+(d.dbSchema.missing&&d.dbSchema.missing.length?"нет таблиц: "+d.dbSchema.missing.join(", "):"не хватает колонок в "+((d.dbSchema.badColumns||[]).map(function(x){return x.table}).join(", ")||"users")));
+  if(!d.snapshot)bad("Нет снапшота");else if(d.snapshot.ageSeconds>2100)bad("Снапшот устарел ("+age(d.snapshot.ageSeconds)+")");
  if(d.snapshot&&d.snapshot.pendingRetry)wr("Есть неудачные доставки (retry)");
  if(f.upstream&&!f.upstream.ok&&!f.upstream.rateLimited)bad("alerts.in.ua: "+f.upstream.error);
   if(d.cron&&d.cron.state==="fail"&&Date.now()-d.cron.lastAt<900000)wr("Cron: сбой опроса alerts.in.ua с "+dtm(d.cron.since)+" ("+d.cron.error+")");
@@ -2072,7 +2179,10 @@ export default {
         const c = await readCache(env.DB);
         out.snapshot = c ? { ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000), pendingRetry: c.pendingRetry || 0 } : null;
       } catch (e) { out.snapshot = { error: String(e).slice(0, 200) }; }
+      const schema = await checkSchema(env.DB);
+      out.db = { ok: schema.ok, missing: schema.missing, badColumns: schema.badColumns };
       if (await isAdmin(request, env)) {
+        out.db.tables = schema.tables;
         try {
           const d = await fetchUpstreamShared(env, 45000);
           out.upstream = { ok: true, oblasts: (d.oblasts || []).length, raions: (d.raions || []).length };
@@ -2097,7 +2207,7 @@ export default {
     }
 
     if (url.pathname === "/telegram/webhook" && method === "POST") {
-      return await handleTelegramWebhook(request, env);
+      return await handleTelegramWebhook(request, env, ctx);
     }
 
     const deviceMatch = url.pathname.match(/^\/telegram\/get-chat-id\/([a-zA-Z0-9-]+)$/);
@@ -2117,7 +2227,13 @@ export default {
         }
 
         const key = `user:${chat_id}`;
-        const existing = await readUser(env, key);
+        let existing;
+        try {
+          existing = await readUser(env, key, true);
+        } catch (e) {
+          console.error("[register] users table read failed:", e);
+          return json({ error: "database_unavailable", detail: String(e && e.message || e).slice(0, 200) }, 503);
+        }
 
         let deviceLink = null;
         if (body.device_id) {
@@ -2176,7 +2292,16 @@ export default {
         const relinked = !!deviceLink;
         const resync = !existing || locationsChanged || (notifyChanged && notify) || relinked;
 
-        const snapshot = nextLocations.length ? await getSharedSnapshot(env) : null;
+        let snapshot = null;
+        if (nextLocations.length) {
+          try {
+            snapshot = await getSharedSnapshot(env);
+          } catch (e) {
+            // An alerts.in.ua outage must not prevent the account from being
+            // saved. Fall back to a clear state; the cron will resync it.
+            console.error("[register] snapshot unavailable, saving with clear state:", e);
+          }
+        }
         const statuses = {};
         let firstStatus = { state: "clear", since: null };
         for (const location of nextLocations) {
@@ -2237,7 +2362,14 @@ export default {
           existing.sync_token === token &&
           JSON.stringify(normalizeSessions(existing)) === JSON.stringify(userData.sessions);
         const changed = !nothingChanged;
-        if (changed) await writeUser(env, key, userData);
+        if (changed) {
+          try {
+            await writeUser(env, key, userData);
+          } catch (e) {
+            console.error("[register] users table write failed:", e);
+            return json({ error: "database_write_failed", detail: "could not save user; check D1 schema and logs" }, 503);
+          }
+        }
         const isNewDeviceLink = !!deviceLink;
         if (deviceLink) await deleteDeviceLink(env, body.device_id);
 

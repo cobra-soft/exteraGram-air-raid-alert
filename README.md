@@ -32,10 +32,20 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
    - `BOT_TOKEN` — your Telegram bot token.
    - `ALERTS_API_KEY` — your alerts.in.ua key.
    - `ADMIN_TOKEN` — the dashboard password. Without it the dashboard is disabled.
+   - `WEBHOOK_SECRET` — *optional.* Used to authenticate Telegram webhook calls. If omitted, the Worker generates one on first use and stores it in D1 (`cache_kv`). If you set it **after** the webhook was already registered, press *Setup webhook* again so Telegram starts sending the matching `secret_token`.
 6. **Add the cron trigger.** Worker → *Settings* → *Triggers* → *Cron Triggers* → add `* * * * *`.
 7. **Register the Telegram webhook.** Open `https://<your-worker>/admin`, log in with `ADMIN_TOKEN`, and run the *Setup webhook* action. (Or open `https://<your-worker>/setup-webhook` after logging in.)
 
-> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so replace the `<KV_NAMESPACE_ID>` and `<D1_DATABASE_ID>` placeholders first. You do not need Node.js on your machine for this either.
+> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so make sure the `database_id` in `wrangler.toml` matches your D1 database. You do not need Node.js on your machine for this either.
+
+### Troubleshooting: new users are not saved and the plugin cannot connect
+The plugin's "connect" flow needs Telegram `/start <device_id>` to reach the Worker and write a row into `device_links`. If that step is broken, `/register` for a brand-new chat returns `403 missing device link`, and nothing is written to `users` (existing users keep working, because they already have a `chat_id` + `sync_token`).
+
+Check, in order:
+1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, run `d1_full_schema.sql` in the D1 console.
+2. `GET /webhook-info` (admin) — the URL must be `https://<your-worker>/telegram/webhook`, `pending_update_count` should not grow, and `last_error_message` must be empty. A `401 Unauthorized` there means the webhook was registered without the `secret_token` the Worker expects: open `/admin` → *Setup webhook*.
+3. Worker logs — `[device] write error`, `[user] write error` or `database_unavailable`/`database_write_failed` responses point to a missing table or missing `users` column.
+4. The Worker now self-heals a mismatched webhook: on the first Telegram update rejected for a bad secret it re-registers the webhook with the correct secret and returns 401 so Telegram retries.
 
 ### Bindings
 | Binding | Type | Purpose |
@@ -75,6 +85,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 | GET | `/api` | Current alert status (cached at the edge) |
 | POST | `/register` | Register or update a user's location and notification settings |
 | POST | `/unregister` | Remove a user |
+| GET | `/telegram/get-chat-id/{device_id}` | Poll the result of the `/start` device-link step |
 | POST | `/telegram/webhook` | Telegram updates (`message`, `callback_query`) |
 | POST | `/telegram/test` | Send a test message to a user |
 | GET | `/webhook-info` | Telegram webhook status |
@@ -112,10 +123,20 @@ The Worker does not send user data to any third party other than Telegram (to de
    - `BOT_TOKEN` — токен вашего Telegram-бота.
    - `ALERTS_API_KEY` — ключ alerts.in.ua.
    - `ADMIN_TOKEN` — пароль панели. Без него панель отключена.
+   - `WEBHOOK_SECRET` — *необязательно.* Секрет для проверки запросов от Telegram. Если не задан, Worker сгенерирует его сам при первом использовании и сохранит в D1 (`cache_kv`). Если задать его **после** регистрации вебхука, нажмите *Setup webhook* ещё раз, чтобы Telegram начал присылать совпадающий `secret_token`.
 6. **Добавьте cron-триггер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → добавьте `* * * * *`.
 7. **Зарегистрируйте вебхук Telegram.** Откройте `https://<ваш-worker>/admin`, войдите с `ADMIN_TOKEN` и выполните действие *Setup webhook*. (Или откройте `https://<ваш-worker>/setup-webhook` после входа.)
 
-> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому сначала замените плейсхолдеры `<KV_NAMESPACE_ID>` и `<D1_DATABASE_ID>`. Для этого тоже не нужен Node.js на вашем компьютере.
+> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому убедитесь, что `database_id` в `wrangler.toml` совпадает с вашей базой D1. Для этого тоже не нужен Node.js на вашем компьютере.
+
+### Если новые пользователи не сохраняются, а плагин не подключается
+«Вход» в плагине требует, чтобы Telegram-команда `/start <device_id>` дошла до Worker и создала строку в `device_links`. Если этот шаг сломан, `/register` для нового чата возвращает `403 missing device link`, и в `users` ничего не пишется (старые пользователи продолжают работать — у них уже есть `chat_id` и `sync_token`).
+
+Проверяйте по порядку:
+1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, выполните `d1_full_schema.sql` в консоли D1.
+2. `GET /webhook-info` (под админом) — URL должен быть `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не должен расти, а `last_error_message` должен быть пустым. `401 Unauthorized` означает, что вебхук зарегистрирован без того `secret_token`, который ждёт Worker: откройте `/admin` → *Setup webhook*.
+3. Логи Worker — `[device] write error`, `[user] write error`, ответы `database_unavailable`/`database_write_failed` указывают на отсутствующую таблицу или колонку в `users`.
+4. Worker теперь сам лечит рассинхрон вебхука: на первом апдейте, отклонённом из-за неверного секрета, он перерегистрирует вебхук с правильным секретом и отвечает 401, чтобы Telegram повторил доставку.
 
 ### Биндинги
 | Биндинг | Тип | Назначение |
@@ -192,10 +213,20 @@ Worker не передаёт пользовательские данные ни�
    - `BOT_TOKEN` — токен вашого Telegram-бота.
    - `ALERTS_API_KEY` — ключ alerts.in.ua.
    - `ADMIN_TOKEN` — пароль панелі. Без нього панель вимкнена.
+   - `WEBHOOK_SECRET` — *необов'язково.* Секрет для перевірки запитів від Telegram. Якщо не заданий, Worker згенерує його сам при першому використанні та збереже в D1 (`cache_kv`). Якщо задати його **після** реєстрації вебхука, натисніть *Setup webhook* ще раз, щоб Telegram почав надсилати відповідний `secret_token`.
 6. **Додайте cron-тригер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → додайте `* * * * *`.
 7. **Зареєструйте вебхук Telegram.** Відкрийте `https://<ваш-worker>/admin`, увійдіть з `ADMIN_TOKEN` і виконайте дію *Setup webhook*. (Або відкрийте `https://<ваш-worker>/setup-webhook` після входу.)
 
-> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому спочатку замініть плейсхолдери `<KV_NAMESPACE_ID>` і `<D1_DATABASE_ID>`. Для цього також не потрібен Node.js на вашому комп'ютері.
+> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому переконайтеся, що `database_id` у `wrangler.toml` збігається з вашою базою D1. Для цього також не потрібен Node.js на вашому комп'ютері.
+
+### Якщо нові користувачі не зберігаються, а плагін не підключається
+«Вхід» у плагіні вимагає, щоб команда Telegram `/start <device_id>` дійшла до Worker і створила рядок у `device_links`. Якщо цей крок зламано, `/register` для нового чату повертає `403 missing device link`, і в `users` нічого не записується (старі користувачі працюють далі — у них уже є `chat_id` і `sync_token`).
+
+Перевіряйте по порядку:
+1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, виконайте `d1_full_schema.sql` у консолі D1.
+2. `GET /webhook-info` (під адміном) — URL має бути `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не має зростати, а `last_error_message` — бути порожнім. `401 Unauthorized` означає, що вебхук зареєстровано без того `secret_token`, який очікує Worker: відкрийте `/admin` → *Setup webhook*.
+3. Логи Worker — `[device] write error`, `[user] write error`, відповіді `database_unavailable`/`database_write_failed` вказують на відсутню таблицю або колонку в `users`.
+4. Worker тепер сам лікує розсинхрон вебхука: на першому апдейті, відхиленому через неправильний секрет, він перереєструє вебхук із правильним секретом і відповідає 401, щоб Telegram повторив доставку.
 
 ### Біндинги
 | Біндинг | Тип | Призначення |
