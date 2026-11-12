@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.2";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.3";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1699,7 +1699,7 @@ function loginPage(msg, status = 200) {
  input:focus{border-color:#aeabd9;box-shadow:0 0 0 4px rgba(174,171,217,0.2)}
  .tools{display:flex;gap:8px}.tools button{flex:1;height:40px;background:rgba(174,171,217,0.08);border:1px solid rgba(63,62,76,0.9);border-radius:14px;color:#e5e5eb;font:500 14px Roboto,system-ui,sans-serif;cursor:pointer}
  .h{font-size:12px;min-height:16px;color:#adacb9}
- button{height:48px;border:0;border-radius:16px;background:#aeabd9;color:#1d1a42;font:600 16px Roboto,system-ui,sans-serif;cursor:pointer;box-shadow:0 6px 16px rgba(174,171,217,0.3)}
+ button{height:44px;border:0;border-radius:12px;background:#aeabd9;color:#1d1a42;font:600 15px Roboto,system-ui,sans-serif;cursor:pointer}
  button:active{transform:translateY(1px)}</style></head>
 <body><form method="post" action="/admin/login"><h1>Air Raid Worker</h1><p>Панель владельца. Введите пароль.</p>
 ${msg ? `<p class="e">${msg}</p>` : ""}
@@ -2019,15 +2019,16 @@ body{margin:0;background:var(--app-bg);background-attachment:fixed;color:var(--t
 .chip.on{background:var(--pr);color:var(--onpr);border-color:transparent}
 .field{background:var(--s3);border-radius:28px;height:48px;display:flex;align-items:center;padding:0 16px;gap:12px}
 .field input{flex:1;min-width:0;width:100%;background:none;border:0;outline:0;color:var(--tx);font:inherit;font-size:16px}
-.btn{height:40px;padding:0 24px;border-radius:14px;font:600 14px var(--f);cursor:pointer;background:var(--pr);color:var(--onpr);box-shadow:0 4px 14px rgba(174,171,217,0.28)}
+.btn{height:34px;padding:0 14px;border-radius:10px;font:600 13px var(--f);cursor:pointer;background:var(--pr);color:var(--onpr);line-height:34px}
 .btn:hover{filter:brightness(1.15)}.btn.f{background:var(--pr);color:var(--onpr)}.btn.o{background:none;border:1px solid var(--ol);color:var(--pr);flex:none;white-space:nowrap}.btn.t{background:none;color:var(--pr);padding:0 12px}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row .field{min-width:0}
+ .btns{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px}.btns .btn{width:100%;text-align:center;padding:0 10px}
 .bar{height:8px;border-radius:4px;background:var(--s3);overflow:hidden;margin-top:4px}.bar i{display:block;height:100%;background:var(--pr);border-radius:4px}
 .bl{display:flex;justify-content:space-between;margin-top:10px;font-size:13px}
 .tag{padding:2px 10px;border-radius:8px;font-size:12px;font-weight:500}.tag.red{background:var(--errc);color:var(--err)}.tag.yellow{background:var(--warnc);color:var(--warn)}
 .empty{text-align:center;color:var(--tv);padding:32px 8px}.empty .big{font-size:40px}
 pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospace,Menlo,monospace;color:var(--tv);max-height:360px;overflow:auto}
-.fab{position:fixed;right:16px;bottom:24px;height:56px;padding:0 20px 0 16px;border-radius:16px;border:0;background:var(--pr);color:var(--onpr);font:600 14px var(--f);display:flex;align-items:center;gap:12px;cursor:pointer;box-shadow:0 8px 24px rgba(174,171,217,0.3);z-index:6}
+.fab{position:fixed;right:16px;bottom:24px;height:44px;padding:0 16px 0 12px;border-radius:12px;border:0;background:var(--pr);color:var(--onpr);font:600 13px var(--f);display:flex;align-items:center;gap:8px;cursor:pointer;z-index:6}
 .fab svg{width:24px;height:24px;fill:currentColor}
 .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;place-items:center;z-index:20}.scrim.on{display:grid}
 .dlg{background:var(--app-surface);border:1px solid var(--ol);border-radius:28px;padding:24px;width:min(360px,calc(100% - 32px))}.dlg h3{margin:0 0 16px;font:400 24px/32px var(--f)}.dlg p{margin:0 0 24px;color:var(--tv)}.dlg .row{justify-content:flex-end}
@@ -2148,7 +2149,7 @@ function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false}
  o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
    +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена cron\\\'ом до завершения. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
    +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
+ o+=card("Действия",'<div class="sh">Проверки</div><div class="btns"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button></div><div class="sh">Обслуживание</div><div class="btns"><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button></div><div class="sh">Рассылка и данные</div><div class="btns"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;justify-content:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
