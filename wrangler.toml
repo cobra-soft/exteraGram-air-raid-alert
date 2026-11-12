@@ -20,23 +20,13 @@ crons = ["* * * * *"]
 
 [[durable_objects.bindings]]
 name = "TICKER"
-class_name = "AlertTickerV2"
+class_name = "AlertTicker"
 
 # SQLite-backed Durable Object (available on the free plan). Applied
 # automatically by `wrangler deploy` (including Workers Builds).
-#
-# v2 deletes the original AlertTicker class and creates AlertTickerV2: a running
-# alarm loop keeps its Durable Object on the old code across deploys, so the
-# class had to be replaced to make code changes take effect (and to stop the
-# old 8 s loop that was hitting alerts.in.ua's rate limit).
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AlertTicker"]
-
-[[migrations]]
-tag = "v2"
-deleted_classes = ["AlertTicker"]
-new_sqlite_classes = ["AlertTickerV2"]
 
 [vars]
 ENVIRONMENT = "production"

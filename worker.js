@@ -2600,7 +2600,7 @@ export default {
   }
 };
 
-export class AlertTickerV2 {
+export class AlertTicker {
   constructor(state, env) {
     this.state = state;
     this.env = env;
