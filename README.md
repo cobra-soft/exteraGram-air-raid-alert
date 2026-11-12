@@ -12,7 +12,7 @@ Cloudflare Worker that polls [alerts.in.ua](https://alerts.in.ua), keeps a snaps
 - Polls the alerts API every few seconds (Durable Object alarm loop) and stores a snapshot in D1. The minute cron only restarts that loop, so a new alert reaches Telegram in ~15 seconds instead of up to a minute.
 - Notifies Telegram users when their oblast or district changes state (red / yellow / clear).
 - Lets plugins register a location, toggle notifications, and read the current status through a public `/api` endpoint.
-- Serves a password-protected owner dashboard at `/admin`.
+- Serves a password-protected owner dashboard at `/admin`. Maintenance mode in the dashboard pauses alert delivery and messages every subscribed user, in their language, when it starts and ends.
 
 ### Requirements
 - A Cloudflare account (free plan is enough).
@@ -109,7 +109,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 - Опрашивает API alerts.in.ua каждые несколько секунд (цикл alarm в Durable Object) и сохраняет снимок активных тревог в D1. Cron раз в минуту только перезапускает этот цикл, поэтому новая тревога приходит в Telegram за ~15 секунд, а не до минуты.
 - Отправляет пользователям в Telegram уведомления, когда статус их области или района меняется (красный / жёлтый / отбой).
 - Позволяет плагинам регистрировать локацию, включать и выключать уведомления и получать текущий статус через публичный `/api`.
-- Предоставляет панель владельца на `/admin` с паролем.
+- Предоставляет панель владельца на `/admin` с паролем. Режим тех. работ в панели приостанавливает рассылку и отправляет всем подписанным пользователям сообщение на их языке о начале и завершении работ.
 
 ### Требования
 - Аккаунт Cloudflare (бесплатного тарифа достаточно).
@@ -205,7 +205,7 @@ Worker не передаёт пользовательские данные ни�
 - Опитує API alerts.in.ua кожні кілька секунд (цикл alarm у Durable Object) і зберігає снімок активних тривог у D1. Cron раз на хвилину лише перезапускає цей цикл, тому нова тривога надходить у Telegram за ~15 секунд, а не до хвилини.
 - Надсилає користувачам у Telegram сповіщення, коли змінюється статус їхньої області або району (червоний / жовтий / відбій).
 - Дозволяє плагінам реєструвати локацію, вмикати й вимикати сповіщення та отримувати поточний статус через публічний `/api`.
-- Надає панель власника на `/admin` із паролем.
+- Надає панель власника на `/admin` із паролем. Режим тех. робіт у панелі призупиняє розсилку й надсилає всім підписаним користувачам повідомлення їхньою мовою про початок і завершення робіт.
 
 ### Вимоги
 - Акаунт Cloudflare (достатньо безкоштовного тарифу).
