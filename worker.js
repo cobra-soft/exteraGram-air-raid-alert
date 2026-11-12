@@ -28,7 +28,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 10;
-const WORKER_VERSION = "air-raid-panel-2026-11-12";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.1";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -258,6 +258,44 @@ async function d1PutKV(db, key, value) {
   } catch (e) {
     console.error(`[d1] write error for ${key}:`, e);
   }
+}
+
+const D1_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (
+    chat_id TEXT PRIMARY KEY, sync_token TEXT, oblast_key TEXT, district_key TEXT,
+    region_name TEXT, lang TEXT, notify INTEGER DEFAULT 1, telegram_connected INTEGER DEFAULT 0,
+    registered_at TEXT, last_activity TEXT, last_check TEXT, last_alert_state TEXT,
+    last_alert_active INTEGER, last_alert_start TEXT, last_alert_end TEXT, raw TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_users_active ON users (oblast_key, district_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_users_notify ON users (notify)`,
+  `CREATE TABLE IF NOT EXISTS cache_kv (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS notified_events (dedupe_key TEXT PRIMARY KEY, created_at INTEGER)`,
+  `CREATE INDEX IF NOT EXISTS idx_notified_events_created ON notified_events (created_at)`,
+  `CREATE TABLE IF NOT EXISTS device_links (
+    device_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, lang TEXT, sync_token TEXT,
+    connected_at TEXT, expires_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_device_links_expires ON device_links (expires_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id)`
+];
+
+async function ensureSchema(env) {
+  const out = { ok: true, executed: [], errors: [] };
+  for (const sql of D1_SCHEMA) {
+    const m = sql.match(/(?:TABLE|INDEX)\s+(?:IF NOT EXISTS\s+)?([a-z_]+)/i);
+    const name = m ? m[1] : "statement";
+    try {
+      await env.DB.prepare(sql).run();
+      out.executed.push(name);
+    } catch (e) {
+      out.ok = false;
+      out.errors.push({ name, error: String(e && e.message || e).slice(0, 200) });
+    }
+  }
+  out.schema = await checkSchema(env.DB);
+  if (!out.schema.ok) out.ok = false;
+  return out;
 }
 
 const REQUIRED_TABLES = {
@@ -1898,6 +1936,7 @@ async function handleAdmin(request, env, url) {
   }
   if (p === "/admin/action" && request.method === "POST") {
     const name = url.searchParams.get("name");
+    if (name === "init-schema") return json(await ensureSchema(env));
     if (name === "setup-webhook") return await handleSetupWebhook(request, env);
     if (name === "purge-edge") {
       const u = new URL(request.url); u.pathname = "/api"; u.search = "";
@@ -2109,7 +2148,7 @@ function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false}
  o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
    +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена cron\\\'ом до завершения. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
    +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
- o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
+ o+=card("Действия",'<div class="row"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));

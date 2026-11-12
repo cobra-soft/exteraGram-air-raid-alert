@@ -42,7 +42,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 The plugin's "connect" flow needs Telegram `/start <device_id>` to reach the Worker and write a row into `device_links`. If that step is broken, `/register` for a brand-new chat returns `403 missing device link`, and nothing is written to `users` (existing users keep working, because they already have a `chat_id` + `sync_token`).
 
 Check, in order:
-1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, run `d1_full_schema.sql` in the D1 console.
+1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, open `/admin` → *Инициализировать D1* (runs the same DDL from the Worker) or run `d1_full_schema.sql` in the D1 console.
 2. `GET /webhook-info` (admin) — the URL must be `https://<your-worker>/telegram/webhook`, `pending_update_count` should not grow, and `last_error_message` must be empty. A `401 Unauthorized` there means the webhook was registered without the `secret_token` the Worker expects: open `/admin` → *Setup webhook*.
 3. Worker logs — `[device] write error`, `[user] write error` or `database_unavailable`/`database_write_failed` responses point to a missing table or missing `users` column.
 4. The Worker now self-heals a mismatched webhook: on the first Telegram update rejected for a bad secret it re-registers the webhook with the correct secret and returns 401 so Telegram retries.
@@ -133,7 +133,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 «Вход» в плагине требует, чтобы Telegram-команда `/start <device_id>` дошла до Worker и создала строку в `device_links`. Если этот шаг сломан, `/register` для нового чата возвращает `403 missing device link`, и в `users` ничего не пишется (старые пользователи продолжают работать — у них уже есть `chat_id` и `sync_token`).
 
 Проверяйте по порядку:
-1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, выполните `d1_full_schema.sql` в консоли D1.
+1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, откройте `/admin` → *Инициализировать D1* (воркер выполнит тот же DDL) или выполните `d1_full_schema.sql` в консоли D1.
 2. `GET /webhook-info` (под админом) — URL должен быть `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не должен расти, а `last_error_message` должен быть пустым. `401 Unauthorized` означает, что вебхук зарегистрирован без того `secret_token`, который ждёт Worker: откройте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, ответы `database_unavailable`/`database_write_failed` указывают на отсутствующую таблицу или колонку в `users`.
 4. Worker теперь сам лечит рассинхрон вебхука: на первом апдейте, отклонённом из-за неверного секрета, он перерегистрирует вебхук с правильным секретом и отвечает 401, чтобы Telegram повторил доставку.
@@ -223,7 +223,7 @@ Worker не передаёт пользовательские данные ни�
 «Вхід» у плагіні вимагає, щоб команда Telegram `/start <device_id>` дійшла до Worker і створила рядок у `device_links`. Якщо цей крок зламано, `/register` для нового чату повертає `403 missing device link`, і в `users` нічого не записується (старі користувачі працюють далі — у них уже є `chat_id` і `sync_token`).
 
 Перевіряйте по порядку:
-1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, виконайте `d1_full_schema.sql` у консолі D1.
+1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, відкрийте `/admin` → *Ініціалізувати D1* (воркер виконає той самий DDL) або виконайте `d1_full_schema.sql` у консолі D1.
 2. `GET /webhook-info` (під адміном) — URL має бути `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не має зростати, а `last_error_message` — бути порожнім. `401 Unauthorized` означає, що вебхук зареєстровано без того `secret_token`, який очікує Worker: відкрийте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, відповіді `database_unavailable`/`database_write_failed` вказують на відсутню таблицю або колонку в `users`.
 4. Worker тепер сам лікує розсинхрон вебхука: на першому апдейті, відхиленому через неправильний секрет, він перереєструє вебхук із правильним секретом і відповідає 401, щоб Telegram повторив доставку.
