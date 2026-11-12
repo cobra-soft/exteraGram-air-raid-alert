@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.15";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.16";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1178,42 +1178,94 @@ const MAINTENANCE_TEXTS = {
   }
 };
 
-async function broadcastMaintenance(env, active, customMessage) {
-  if (!env.BOT_TOKEN) {
-    console.error("[maintenance] BOT_TOKEN not set, broadcast skipped");
-    return { sent: 0, failed: 0 };
+const MAINTENANCE_BROADCAST_KEY = "maintenance-broadcast";
+const MAINTENANCE_BATCH = 40;
+const MAINTENANCE_LEASE_MS = 60 * 1000;
+
+async function readMaintenanceBroadcast(env) {
+  try {
+    const raw = await d1GetKV(env.DB, MAINTENANCE_BROADCAST_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    console.error("[maintenance] broadcast read error:", e);
+    return null;
   }
-  const custom = String(customMessage || "").trim();
-  const PAGE_SIZE = 500;
-  let offset = 0;
+}
+
+async function writeMaintenanceBroadcast(env, job) {
+  await d1PutKV(env.DB, MAINTENANCE_BROADCAST_KEY, JSON.stringify(job));
+}
+
+async function queueMaintenanceBroadcast(env, active, message) {
+  const job = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    active: !!active,
+    message: String(message || ""),
+    status: "pending",
+    offset: 0,
+    sent: 0,
+    failed: 0,
+    queuedAt: new Date().toISOString(),
+    finishedAt: null,
+    leaseUntil: 0,
+    error: null
+  };
+  await writeMaintenanceBroadcast(env, job);
+  return job;
+}
+
+async function processMaintenanceBroadcast(env) {
+  const job = await readMaintenanceBroadcast(env);
+  if (!job || job.status === "done") return job;
+  const now = Date.now();
+  if (job.leaseUntil && job.leaseUntil > now) return job;
+  job.leaseUntil = now + MAINTENANCE_LEASE_MS;
+  job.status = "running";
+  job.error = null;
+  await writeMaintenanceBroadcast(env, job);
+
+  if (!env.BOT_TOKEN) {
+    job.status = "done";
+    job.error = "BOT_TOKEN is not set";
+    job.finishedAt = new Date().toISOString();
+    await writeMaintenanceBroadcast(env, job);
+    return job;
+  }
+
+  const custom = String(job.message || "").trim();
+  const offset = Number(job.offset) || 0;
+  const rows = await listUsersPage(env, offset, MAINTENANCE_BATCH, true);
+  const sends = [];
+  for (const row of rows) {
+    const user = rowToUser(row);
+    if (!user || !user.chat_id) continue;
+    const texts = MAINTENANCE_TEXTS[normLang(user.lang)];
+    const text = (job.active ? texts.on : texts.off) + (job.active && custom ? `\n\n${escapeHtml(custom)}` : "");
+    sends.push({ chatId: user.chat_id, text });
+  }
+
   let sent = 0;
   let failed = 0;
-  try {
-    while (true) {
-      const rows = await listUsersPage(env, offset, PAGE_SIZE, true);
-      if (!rows.length) break;
-      const jobs = [];
-      for (const row of rows) {
-        const user = rowToUser(row);
-        if (!user || !user.chat_id || user.notify === false) continue;
-        const texts = MAINTENANCE_TEXTS[normLang(user.lang)];
-        const text = (active ? texts.on : texts.off) + (active && custom ? `\n\n${escapeHtml(custom)}` : "");
-        jobs.push({ chatId: user.chat_id, text });
-      }
-      for (let i = 0; i < jobs.length; i += SEND_CONCURRENCY) {
-        const results = await Promise.all(jobs.slice(i, i + SEND_CONCURRENCY).map(job =>
-          sendTelegramTracked(env, job.chatId, job.text).then(r => !!(r && r.ok)).catch(() => false)
-        ));
-        for (const ok of results) ok ? sent++ : failed++;
-      }
-      offset += rows.length;
-      if (rows.length < PAGE_SIZE) break;
-    }
-  } catch (e) {
-    console.error("[maintenance] broadcast error:", e);
+  for (let i = 0; i < sends.length; i += SEND_CONCURRENCY) {
+    const results = await Promise.all(sends.slice(i, i + SEND_CONCURRENCY).map(item =>
+      sendTelegramTracked(env, item.chatId, item.text).then(r => !!(r && r.ok)).catch(() => false)
+    ));
+    for (const ok of results) ok ? sent++ : failed++;
   }
-  console.log(`[maintenance] broadcast ${active ? "on" : "off"}: sent=${sent} failed=${failed}`);
-  return { sent, failed };
+
+  job.sent = (Number(job.sent) || 0) + sent;
+  job.failed = (Number(job.failed) || 0) + failed;
+  job.offset = offset + rows.length;
+  job.leaseUntil = 0;
+  if (rows.length < MAINTENANCE_BATCH) {
+    job.status = "done";
+    job.finishedAt = new Date().toISOString();
+  } else {
+    job.status = "pending";
+  }
+  await writeMaintenanceBroadcast(env, job);
+  console.log(`[maintenance] broadcast ${job.active ? "on" : "off"} batch: sent=${sent} failed=${failed}, offset=${job.offset}, status=${job.status}`);
+  return job;
 }
 
 function formatDuration(ms, lang) {
@@ -1909,6 +1961,7 @@ async function adminData(env, request, full, kvTest, probeUp) {
   const c = await readCache(env.DB);
   try { const cronRaw = await d1GetKV(env.DB, CRON_STATUS_KEY); out.cron = cronRaw ? JSON.parse(cronRaw) : null; } catch (e) { out.cron = null; }
   out.maintenance = await getMaintenance(env);
+  try { out.maintenanceBroadcast = await readMaintenanceBroadcast(env); } catch (e) { out.maintenanceBroadcast = null; }
   out.dbSchema = await checkSchema(env.DB);
   out.snapshot = c ? {
     fetchedAt: c.fetchedAt, ageSeconds: Math.round((Date.now() - (c.fetchedAt || 0)) / 1000),
@@ -2018,16 +2071,25 @@ async function handleAdmin(request, env, url, ctx) {
       } catch (e) { }
       await setMaintenance(env, true, message);
       const maintenance = await getMaintenance(env);
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(broadcastMaintenance(env, true, message));
-      else await broadcastMaintenance(env, true, message);
-      return adminJson({ ok: true, maintenance });
+      const job = await queueMaintenanceBroadcast(env, true, message);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(processMaintenanceBroadcast(env));
+      else await processMaintenanceBroadcast(env);
+      return adminJson({ ok: true, maintenance, broadcast: job });
     }
     if (name === "maintenance-off") {
       await setMaintenance(env, false, null);
       const maintenance = await getMaintenance(env);
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(broadcastMaintenance(env, false, null));
-      else await broadcastMaintenance(env, false, null);
-      return adminJson({ ok: true, maintenance });
+      const job = await queueMaintenanceBroadcast(env, false, null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(processMaintenanceBroadcast(env));
+      else await processMaintenanceBroadcast(env);
+      return adminJson({ ok: true, maintenance, broadcast: job });
+    }
+    if (name === "maintenance-resend") {
+      const maintenance = await getMaintenance(env);
+      const job = await queueMaintenanceBroadcast(env, maintenance.active, null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(processMaintenanceBroadcast(env));
+      else await processMaintenanceBroadcast(env);
+      return adminJson({ ok: true, maintenance, broadcast: job });
     }
     if (name === "resync-notify") {
       const maint = await getMaintenance(env);
@@ -2220,9 +2282,12 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false};
- o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+'<div class="row" style="margin-top:12px">'
+ var mb=d.maintenanceBroadcast,bLine="";
+ if(mb){var bstat=mb.status==="done"?"готово":(mb.status==="running"?"идёт":"в очереди");bLine=kv("Рассылка",bstat+" · отправлено "+(mb.sent||0)+(mb.failed?" · ошибок "+mb.failed:"")+(mb.error?" · "+mb.error:""),mb.error?"bad":(mb.status==="done"?"ok":"warn"));}
+ o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+bLine+'<div class="row" style="margin-top:12px;flex-wrap:wrap">'
    +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена до завершения работ. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
-   +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button></div>');
+   +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button>'
+   +'<button class="btn t" onclick="ask(\\'maintenance-resend\\',\\'Повторить рассылку?\\',\\'Отправит уведомление о текущем режиме тех. работ всем пользователям ещё раз.\\')">Повторить рассылку</button></div>');
  o+=card("Действия",'<div class="sh">Проверки</div><div class="btns"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button></div><div class="sh">Обслуживание</div><div class="btns"><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button></div><div class="sh">Рассылка и данные</div><div class="btns"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;justify-content:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
  if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
@@ -2618,6 +2683,11 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    try {
+      await processMaintenanceBroadcast(env);
+    } catch (e) {
+      console.error("[maintenance] broadcast cron error:", e);
+    }
     let viaTicker = false;
     if (env.TICKER) {
       try {
@@ -2768,6 +2838,11 @@ export class AlertTicker {
     const started = Date.now();
     this.lastRunAt = new Date().toISOString();
     try {
+      try {
+        await processMaintenanceBroadcast(this.env);
+      } catch (e) {
+        console.error("[maintenance] broadcast tick error:", e);
+      }
       await checkAllUsers(this.env);
       this.lastOk = true; this.lastStatus = null; this.lastError = null;
       return { ok: true, at: this.lastRunAt, durationMs: Date.now() - started };
