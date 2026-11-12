@@ -36,7 +36,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 6. **Add the cron trigger.** Worker → *Settings* → *Triggers* → *Cron Triggers* → add `* * * * *`.
 7. **Register the Telegram webhook.** Open `https://<your-worker>/admin`, log in with `ADMIN_TOKEN`, and run the *Setup webhook* action. (Or open `https://<your-worker>/setup-webhook` after logging in.)
 
-> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so make sure the `database_id` in `wrangler.toml` matches your D1 database. You do not need Node.js on your machine for this either.
+> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so make sure the `database_id` in `wrangler.toml` matches your D1 database. You do not need Node.js on your machine for this either. See [wrangler.toml](#wranglertoml) for what each key does.
 
 ### Troubleshooting: new users are not saved and the plugin cannot connect
 The plugin's "connect" flow needs Telegram `/start <device_id>` to reach the Worker and write a row into `device_links`. If that step is broken, `/register` for a brand-new chat returns `403 missing device link`, and nothing is written to `users` (existing users keep working, because they already have a `chat_id` + `sync_token`).
@@ -133,7 +133,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 6. **Добавьте cron-триггер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → добавьте `* * * * *`.
 7. **Зарегистрируйте вебхук Telegram.** Откройте `https://<ваш-worker>/admin`, войдите с `ADMIN_TOKEN` и выполните действие *Setup webhook*. (Или откройте `https://<ваш-worker>/setup-webhook` после входа.)
 
-> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому убедитесь, что `database_id` в `wrangler.toml` совпадает с вашей базой D1. Для этого тоже не нужен Node.js на вашем компьютере.
+> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому убедитесь, что `database_id` в `wrangler.toml` совпадает с вашей базой D1. Для этого тоже не нужен Node.js на вашем компьютере. Подробнее — [wrangler.toml](#wranglertoml).
 
 ### Если новые пользователи не сохраняются, а плагин не подключается
 «Вход» в плагине требует, чтобы Telegram-команда `/start <device_id>` дошла до Worker и создала строку в `device_links`. Если этот шаг сломан, `/register` для нового чата возвращает `403 missing device link`, и в `users` ничего не пишется (старые пользователи продолжают работать — у них уже есть `chat_id` и `sync_token`).
@@ -229,7 +229,7 @@ Worker не передаёт пользовательские данные ни�
 6. **Додайте cron-тригер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → додайте `* * * * *`.
 7. **Зареєструйте вебхук Telegram.** Відкрийте `https://<ваш-worker>/admin`, увійдіть з `ADMIN_TOKEN` і виконайте дію *Setup webhook*. (Або відкрийте `https://<ваш-worker>/setup-webhook` після входу.)
 
-> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому переконайтеся, що `database_id` у `wrangler.toml` збігається з вашою базою D1. Для цього також не потрібен Node.js на вашому комп'ютері.
+> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому переконайтеся, що `database_id` у `wrangler.toml` збігається з вашою базою D1. Для цього також не потрібен Node.js на вашому комп'ютері. Детальніше — [wrangler.toml](#wranglertoml).
 
 ### Якщо нові користувачі не зберігаються, а плагін не підключається
 «Вхід» у плагіні вимагає, щоб команда Telegram `/start <device_id>` дійшла до Worker і створила рядок у `device_links`. Якщо цей крок зламано, `/register` для нового чату повертає `403 missing device link`, і в `users` нічого не записується (старі користувачі працюють далі — у них уже є `chat_id` і `sync_token`).
@@ -291,6 +291,17 @@ Worker не передає користувацькі дані нікому, к�
 ### Безпека
 - Панель використовує вхід за паролем і підписану cookie-сесію (HMAC-SHA256, 7 днів). Скрипти можуть використовувати `Authorization: Bearer <ADMIN_TOKEN>`.
 - Невдалі входи обмежені за IP.
+
+## wrangler.toml
+
+Only used for Git-based deploys (Workers Builds). The file itself is comment-free; what each part is for:
+
+- `keep_vars = true` — **required**: without it `wrangler` may wipe the variables and secrets set in the dashboard (`BOT_TOKEN`, `ALERTS_API_KEY`, `ADMIN_TOKEN`, `WEBHOOK_SECRET`).
+- `database_name` — only a human-readable label; `database_id` is what actually binds the D1 database.
+- `[triggers] crons = ["* * * * *"]` — the minute cron is only a watchdog: it (re)starts the Durable Object alarm loop, which polls every few seconds so alerts are pushed fast.
+- `[[durable_objects.bindings]]` — `TICKER` is the binding the Worker uses for that loop (`AlertTicker`).
+- `[[migrations]]` — `AlertTicker` is a SQLite-backed Durable Object (available on the free plan); the `v1` migration is applied automatically by `wrangler deploy`, including Workers Builds.
+- `[vars]` — plain, non-secret variables (here `ENVIRONMENT = "production"`).
 
 ## Schema (SQL)
 

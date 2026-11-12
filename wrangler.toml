@@ -3,18 +3,10 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 keep_vars = true
 
-# keep_vars = true обязателен при деплое из GitHub:
-# без него wrangler может затереть переменные и секреты, заданные в Dashboard
-# (BOT_TOKEN, ALERTS_API_KEY, ADMIN_TOKEN, WEBHOOK_SECRET).
-#
-# database_name — только читаемая метка; авторитетен database_id.
-
 d1_databases = [
   { binding = "DB", database_name = "air-raid-cache", database_id = "29105073-0b18-467f-be9a-8ad17337bde9" }
 ]
 
-# The minute cron only acts as a watchdog: it (re)starts the Durable Object
-# alarm loop below, which runs every few seconds so alerts are pushed fast.
 [triggers]
 crons = ["* * * * *"]
 
@@ -22,8 +14,6 @@ crons = ["* * * * *"]
 name = "TICKER"
 class_name = "AlertTicker"
 
-# SQLite-backed Durable Object (available on the free plan). Applied
-# automatically by `wrangler deploy` (including Workers Builds).
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AlertTicker"]
