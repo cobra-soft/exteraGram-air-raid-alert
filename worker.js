@@ -1,43 +1,14 @@
-/* Build: 2026-11-02T18:04:39Z */
 
-/*
- * MIT License
- *
- * Copyright © 2026 Bogdan Delas
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
 
 const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.12";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.13";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
 const STALE_SNAPSHOT_MS = 35 * 60 * 1000;
-// The alarm loop polls alerts.in.ua every TICK_MS (Durable Object alarms allow
-// sub-minute scheduling; a cron trigger alone can only run once a minute).
-// alerts.in.ua documents a soft limit of 8-10 requests/minute per IP and a hard
-// limit of 12/minute, so the default stays at 6/minute (10 s) and the loop has
-// its own sliding-window cap. Override with the TICK_MS variable (5000-60000).
 const TICK_MS_DEFAULT = 15000;
 const TICK_MS_MIN = 5000;
 const TICK_MS_MAX = 60000;
@@ -607,8 +578,6 @@ async function fetchUpstreamRetry(env) {
   try {
     return await fetchUpstream(env);
   } catch (e) {
-    // Never retry a 429: that would only deepen the rate-limit violation.
-    // Let the ticker back off for a full minute (or Retry-After) instead.
     if (e && e.status === 429) throw e;
     const transient = e && (e.status >= 500 || (!e.status && !/not configured/.test(String(e.message))));
     if (!transient) throw e;
@@ -980,7 +949,6 @@ function stateMessage(region, status, lang) {
 }
 
 async function checkAllUsers(env) {
-  // Do not spend an upstream request while maintenance mode is on.
   const maint = await getMaintenance(env);
   if (maint.active) {
     console.log("[notify] skipped: maintenance mode is active; snapshot is not advanced");
@@ -1021,9 +989,6 @@ async function checkAllUsers(env) {
   }
 
   const retryAfter = hadFailures ? (retryBefore || now) : 0;
-  // Write the snapshot only after dispatch. fetchedAt doubles as the last
-  // successful upstream check, so a long outage is visible to clear-approximate
-  // messages on the next transition.
   await writeCache(env.DB, data, now, signature, retryAfter);
 }
 
@@ -1489,9 +1454,6 @@ async function randomToken() {
 }
 
 async function checkAndSetEphemeralFlag(name, ttlSeconds) {
-  // Fail-open: a cache failure must never block webhook processing or
-  // registration. Worst case a rate limit is not applied or an update is
-  // processed twice; both are harmless compared with dropping the update.
   try {
     const url = `https://ephemeral-flags.internal/${encodeURIComponent(name)}`;
     const key = new Request(url);
@@ -1594,11 +1556,6 @@ async function handleTelegramWebhookInner(request, env, ctx = null) {
   if (expectedSecret) {
     const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
     if (!safeEqual(got, expectedSecret)) {
-      // The worker requires a secret but Telegram delivered the update without
-      // it (the webhook was registered by an older build, or with another
-      // value). Re-register the webhook with the correct secret in the
-      // background and let Telegram retry; otherwise /start never arrives and
-      // every new user is stuck at "missing device link".
       const task = repairWebhook(request, env);
       if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
       else await task;
@@ -1811,8 +1768,6 @@ function sqlEscape(v) {
 }
 
 async function buildUsersExportSQL(env, overwrite) {
-  // Бэкап/перенос таблицы users из D1 в виде SQL-файла (KV больше не используется,
-  // источник данных — сама таблица D1; полезно для переноса на другую базу).
   const conflict = overwrite
     ? "DO UPDATE SET sync_token=excluded.sync_token, oblast_key=excluded.oblast_key, district_key=excluded.district_key, region_name=excluded.region_name, lang=excluded.lang, notify=excluded.notify, telegram_connected=excluded.telegram_connected, registered_at=excluded.registered_at, last_activity=excluded.last_activity, last_check=excluded.last_check, last_alert_state=excluded.last_alert_state, last_alert_active=excluded.last_alert_active, last_alert_start=excluded.last_alert_start, last_alert_end=excluded.last_alert_end, raw=excluded.raw"
     : "DO NOTHING";
@@ -2422,9 +2377,6 @@ export default {
         }
 
         const previousLocations = userLocations(existing);
-        // Compare only the location identity: region_name is localized, so a
-        // language switch rewrites it and must not look like a new subscription
-        // (that used to resend "Subscription active" + current status).
         const locationSignature = list => JSON.stringify(list.map(l => [l.oblast_key, l.district_key || null]));
         const locationsChanged = !existing || locationSignature(previousLocations) !== locationSignature(nextLocations);
         const langChanged = !!existing && normLang(existing.lang) !== normLang(lang);
@@ -2440,8 +2392,6 @@ export default {
           try {
             snapshot = await getSharedSnapshot(env);
           } catch (e) {
-            // An alerts.in.ua outage must not prevent the account from being
-            // saved. Fall back to a clear state; the cron will resync it.
             console.error("[register] snapshot unavailable, saving with clear state:", e);
           }
         }
@@ -2524,10 +2474,8 @@ export default {
           }
           if (notify) {
             if (nextLocations.length && locationsNeedSync) {
-              // New/changed subscription: one message with the current state.
               await sendTelegramTracked(env, chat_id, confirmationMessage(nextLocations, statuses, lang));
             } else if (notifyChanged) {
-              // Re-enabling notifications must not look like a new subscription.
               await sendTelegramTracked(env, chat_id, m.enabled);
             } else if (langChanged) {
               await sendTelegramTracked(env, chat_id, m.langChanged(LANG_NAMES[normLang(lang)]));
@@ -2611,11 +2559,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Prefer the Durable Object alarm loop: it re-runs every few seconds, so
-    // alerts reach Telegram in seconds instead of waiting for the next
-    // one-minute cron tick. The cron stays as the watchdog that (re)starts
-    // the loop, and falls back to an inline check if the binding is missing
-    // or the DO cannot be reached.
     let viaTicker = false;
     if (env.TICKER) {
       try {
@@ -2746,8 +2689,6 @@ export class AlertTicker {
     const calls = this._recentCalls();
     let delay;
     if (calls >= TICK_MAX_PER_WINDOW) {
-      // Sliding-window guard: never exceed the cap even if the interval was
-      // lowered too far or a manual /tick just ran.
       const oldest = this.recent.filter(t => now - t < TICK_WINDOW_MS)[0] || now;
       delay = Math.max(1000, TICK_WINDOW_MS - (now - oldest) + 250);
     } else {

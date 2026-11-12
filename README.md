@@ -24,7 +24,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 ### Setup (Cloudflare dashboard only)
 1. **Create the storage.**
    - Storage & Databases → D1 SQL Database → *Create database*, name it `air-raid-cache`.
-2. **Create the tables.** Open the D1 database → *Console* and run the contents of `d1_full_schema.sql` (creates `users`, `cache_kv`, `notified_events`, `device_links`). This is a one-time step — Cloudflare keeps the tables after this.
+2. **Create the tables.** Open the D1 database → *Console* and run the SQL from [Schema (SQL)](#schema-sql) (creates `users`, `cache_kv`, `notified_events`, `device_links`). This is a one-time step — Cloudflare keeps the tables after this.
 3. **Create the Worker.** Workers & Pages → *Create* → *Worker* → give it a name → *Edit code*, replace the default code with the contents of `worker.js`, then *Deploy*.
 4. **Add bindings.** Open the Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: variable name `DB`, database `air-raid-cache`.
@@ -42,7 +42,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 The plugin's "connect" flow needs Telegram `/start <device_id>` to reach the Worker and write a row into `device_links`. If that step is broken, `/register` for a brand-new chat returns `403 missing device link`, and nothing is written to `users` (existing users keep working, because they already have a `chat_id` + `sync_token`).
 
 Check, in order:
-1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, open `/admin` → *Инициализировать D1* (runs the same DDL from the Worker) or run `d1_full_schema.sql` in the D1 console.
+1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, open `/admin` → *Инициализировать D1* (runs the same DDL from the Worker) or run the SQL from [Schema (SQL)](#schema-sql).
 2. `GET /webhook-info` (admin) — the URL must be `https://<your-worker>/telegram/webhook`, `pending_update_count` should not grow, and `last_error_message` must be empty. A `401 Unauthorized` there means the webhook was registered without the `secret_token` the Worker expects: open `/admin` → *Setup webhook*.
 3. Worker logs — `[device] write error`, `[user] write error` or `database_unavailable`/`database_write_failed` responses point to a missing table or missing `users` column.
 4. The Worker now self-heals a mismatched webhook: on the first Telegram update rejected for a bad secret it re-registers the webhook with the correct secret and returns 401 so Telegram retries.
@@ -57,7 +57,7 @@ The `TICKER` alarm is started automatically by the cron trigger (every minute it
 
 **Upstream limits.** alerts.in.ua documents a soft limit of 8–10 requests/minute per IP and a hard limit of 12/minute (systematic violations can block the IP and the token). The default is 4 requests/minute (15 s), and the ticker has its own sliding-window cap of 6/minute. Note that the limit is **per source IP**, and Cloudflare Workers share egress IPs with other Cloudflare services, so an occasional 429 is possible even at a low rate; on 429 the ticker backs off for 2 minutes (or `Retry-After`). To trade latency for headroom, set the `TICK_MS` variable in the dashboard (5000–60000 ms) — no redeploy needed. 15 s ≈ 5.8k requests/day; 20 s ≈ 4.3k; 30 s ≈ 2.9k.
 
-All persistent storage lives in this single D1 database. There is no KV namespace — an earlier version used KV for user records, but the project has fully migrated to D1 (see `MIGRATION.md`).
+All persistent storage lives in this single D1 database. There is no KV namespace — an earlier version used KV for user records, but the project has fully migrated to D1.
 
 ### What's stored and where
 The `users` table in D1 is the only place per-user ("account") data lives. For each Telegram chat that registers, it holds:
@@ -121,7 +121,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 ### Установка (только панель Cloudflare)
 1. **Создайте хранилище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назовите `air-raid-cache`.
-2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните содержимое `d1_full_schema.sql` (создаёт `users`, `cache_kv`, `notified_events`, `device_links`). Это разовое действие — Cloudflare сохранит таблицы после него.
+2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните SQL из раздела [Schema (SQL)](#schema-sql) (создаёт `users`, `cache_kv`, `notified_events`, `device_links`). Это разовое действие — Cloudflare сохранит таблицы после него.
 3. **Создайте Worker.** Workers & Pages → *Create* → *Worker* → укажите имя → *Edit code*, замените код по умолчанию содержимым `worker.js`, затем *Deploy*.
 4. **Добавьте биндинги.** Откройте Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: имя переменной `DB`, база `air-raid-cache`.
@@ -139,7 +139,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 «Вход» в плагине требует, чтобы Telegram-команда `/start <device_id>` дошла до Worker и создала строку в `device_links`. Если этот шаг сломан, `/register` для нового чата возвращает `403 missing device link`, и в `users` ничего не пишется (старые пользователи продолжают работать — у них уже есть `chat_id` и `sync_token`).
 
 Проверяйте по порядку:
-1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, откройте `/admin` → *Инициализировать D1* (воркер выполнит тот же DDL) или выполните `d1_full_schema.sql` в консоли D1.
+1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, откройте `/admin` → *Инициализировать D1* (воркер выполнит тот же DDL) или выполните SQL из раздела [Schema (SQL)](#schema-sql).
 2. `GET /webhook-info` (под админом) — URL должен быть `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не должен расти, а `last_error_message` должен быть пустым. `401 Unauthorized` означает, что вебхук зарегистрирован без того `secret_token`, который ждёт Worker: откройте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, ответы `database_unavailable`/`database_write_failed` указывают на отсутствующую таблицу или колонку в `users`.
 4. Worker теперь сам лечит рассинхрон вебхука: на первом апдейте, отклонённом из-за неверного секрета, он перерегистрирует вебхук с правильным секретом и отвечает 401, чтобы Telegram повторил доставку.
@@ -217,7 +217,7 @@ Worker не передаёт пользовательские данные ни�
 ### Встановлення (лише панель Cloudflare)
 1. **Створіть сховище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назвіть `air-raid-cache`.
-2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте вміст `d1_full_schema.sql` (створює `users`, `cache_kv`, `notified_events`, `device_links`). Це одноразова дія — Cloudflare збереже таблиці після неї.
+2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте SQL з розділу [Schema (SQL)](#schema-sql) (створює `users`, `cache_kv`, `notified_events`, `device_links`). Це одноразова дія — Cloudflare збереже таблиці після неї.
 3. **Створіть Worker.** Workers & Pages → *Create* → *Worker* → вкажіть назву → *Edit code*, замініть код за замовчуванням вмістом `worker.js`, потім *Deploy*.
 4. **Додайте біндинги.** Відкрийте Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: назва змінної `DB`, база `air-raid-cache`.
@@ -235,7 +235,7 @@ Worker не передаёт пользовательские данные ни�
 «Вхід» у плагіні вимагає, щоб команда Telegram `/start <device_id>` дійшла до Worker і створила рядок у `device_links`. Якщо цей крок зламано, `/register` для нового чату повертає `403 missing device link`, і в `users` нічого не записується (старі користувачі працюють далі — у них уже є `chat_id` і `sync_token`).
 
 Перевіряйте по порядку:
-1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, відкрийте `/admin` → *Ініціалізувати D1* (воркер виконає той самий DDL) або виконайте `d1_full_schema.sql` у консолі D1.
+1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, відкрийте `/admin` → *Ініціалізувати D1* (воркер виконає той самий DDL) або виконайте SQL з розділу [Schema (SQL)](#schema-sql).
 2. `GET /webhook-info` (під адміном) — URL має бути `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не має зростати, а `last_error_message` — бути порожнім. `401 Unauthorized` означає, що вебхук зареєстровано без того `secret_token`, який очікує Worker: відкрийте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, відповіді `database_unavailable`/`database_write_failed` вказують на відсутню таблицю або колонку в `users`.
 4. Worker тепер сам лікує розсинхрон вебхука: на першому апдейті, відхиленому через неправильний секрет, він перереєструє вебхук із правильним секретом і відповідає 401, щоб Telegram повторив доставку.
@@ -291,6 +291,81 @@ Worker не передає користувацькі дані нікому, к�
 ### Безпека
 - Панель використовує вхід за паролем і підписану cookie-сесію (HMAC-SHA256, 7 днів). Скрипти можуть використовувати `Authorization: Bearer <ADMIN_TOKEN>`.
 - Невдалі входи обмежені за IP.
+
+## Schema (SQL)
+
+One-time D1 setup. After deploying you can instead open `/admin` → *Инициализировать D1*: the Worker runs the same DDL itself. The script is idempotent, so re-running it is safe.
+
+```sql
+-- Air Raid Alert — полная схема D1 для текущего worker.js.
+-- Выполнить один раз в Cloudflare Dashboard → D1 → ваша база → Console.
+-- Скрипт идемпотентный: повторный запуск безопасен.
+--
+-- Без таблицы device_links не работает «вход» плагина: Telegram /start не
+-- может сохранить связку устройство → чат, и новый пользователь никогда не
+-- попадает в users.
+
+-- 1. Пользователи.
+CREATE TABLE IF NOT EXISTS users (
+  chat_id            TEXT PRIMARY KEY,
+  sync_token         TEXT,
+  oblast_key         TEXT,
+  district_key       TEXT,
+  region_name        TEXT,
+  lang               TEXT,
+  notify             INTEGER DEFAULT 1,
+  telegram_connected INTEGER DEFAULT 0,
+  registered_at      TEXT,
+  last_activity      TEXT,
+  last_check         TEXT,
+  last_alert_state   TEXT,
+  last_alert_active  INTEGER,
+  last_alert_start   TEXT,
+  last_alert_end     TEXT,
+  raw                TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_active ON users (oblast_key, district_key);
+CREATE INDEX IF NOT EXISTS idx_users_notify ON users (notify);
+
+-- 2. Кэш снимка тревог, состояние cron и тех.работ.
+CREATE TABLE IF NOT EXISTS cache_kv (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at INTEGER
+);
+
+-- 3. Дедупликация уведомлений.
+CREATE TABLE IF NOT EXISTS notified_events (
+  dedupe_key TEXT PRIMARY KEY,
+  created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_notified_events_created ON notified_events (created_at);
+
+-- 4. Связка установки плагина с Telegram-чатом (сценарий /start).
+CREATE TABLE IF NOT EXISTS device_links (
+  device_id    TEXT PRIMARY KEY,
+  chat_id      TEXT NOT NULL,
+  lang         TEXT,
+  sync_token   TEXT,
+  connected_at TEXT,
+  expires_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_links_expires ON device_links (expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
+
+-- Проверка после выполнения:
+--   SELECT name FROM sqlite_master WHERE type = 'table';
+--   SELECT COUNT(*) AS total FROM users;
+--
+-- Если таблица users уже существовала в старой схеме и в ней не хватает
+-- колонок, INSERT из воркера будет падать. Проверить колонки:
+--   PRAGMA table_info(users);
+-- Недостающие колонки добавить вручную, например:
+--   ALTER TABLE users ADD COLUMN raw TEXT;
+```
 
 ### License
 MIT License
