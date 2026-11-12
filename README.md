@@ -24,7 +24,7 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 ### Setup (Cloudflare dashboard only)
 1. **Create the storage.**
    - Storage & Databases → D1 SQL Database → *Create database*, name it `air-raid-cache`.
-2. **Create the tables.** Open the D1 database → *Console* and run the SQL from [Schema (SQL)](#schema-sql) (creates `users`, `cache_kv`, `notified_events`, `device_links`). This is a one-time step — Cloudflare keeps the tables after this.
+2. **Create the tables.** Open the D1 database → *Console* and run the SQL from [Schema (SQL)](#schema-sql_en) (creates `users`, `cache_kv`, `notified_events`, `device_links`). This is a one-time step — Cloudflare keeps the tables after this.
 3. **Create the Worker.** Workers & Pages → *Create* → *Worker* → give it a name → *Edit code*, replace the default code with the contents of `worker.js`, then *Deploy*.
 4. **Add bindings.** Open the Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: variable name `DB`, database `air-raid-cache`.
@@ -36,13 +36,13 @@ No local tools are needed. Everything is configured in the Cloudflare dashboard,
 6. **Add the cron trigger.** Worker → *Settings* → *Triggers* → *Cron Triggers* → add `* * * * *`.
 7. **Register the Telegram webhook.** Open `https://<your-worker>/admin`, log in with `ADMIN_TOKEN`, and run the *Setup webhook* action. (Or open `https://<your-worker>/setup-webhook` after logging in.)
 
-> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so make sure the `database_id` in `wrangler.toml` matches your D1 database. You do not need Node.js on your machine for this either. See [wrangler.toml](#wranglertoml) for what each key does.
+> **Optional: deploy from a Git repository.** The repo includes `wrangler.toml`, which describes the bindings, cron trigger and variables. If you connect the repo to Workers Builds, Cloudflare reads this file on each push, so make sure the `database_id` in `wrangler.toml` matches your D1 database. You do not need Node.js on your machine for this either. See [wrangler.toml](#wrangler_en) for what each key does.
 
 ### Troubleshooting: new users are not saved and the plugin cannot connect
 The plugin's "connect" flow needs Telegram `/start <device_id>` to reach the Worker and write a row into `device_links`. If that step is broken, `/register` for a brand-new chat returns `403 missing device link`, and nothing is written to `users` (existing users keep working, because they already have a `chat_id` + `sync_token`).
 
 Check, in order:
-1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, open `/admin` → *Инициализировать D1* (runs the same DDL from the Worker) or run the SQL from [Schema (SQL)](#schema-sql).
+1. `GET /health` — `db.ok` must be `true` and `db.missing` empty. If `device_links`/`notified_events` are listed, open `/admin` → *Инициализировать D1* (runs the same DDL from the Worker) or run the SQL from [Schema (SQL)](#schema-sql_en).
 2. `GET /webhook-info` (admin) — the URL must be `https://<your-worker>/telegram/webhook`, `pending_update_count` should not grow, and `last_error_message` must be empty. A `401 Unauthorized` there means the webhook was registered without the `secret_token` the Worker expects: open `/admin` → *Setup webhook*.
 3. Worker logs — `[device] write error`, `[user] write error` or `database_unavailable`/`database_write_failed` responses point to a missing table or missing `users` column.
 4. The Worker now self-heals a mismatched webhook: on the first Telegram update rejected for a bad secret it re-registers the webhook with the correct secret and returns 401 so Telegram retries.
@@ -121,7 +121,7 @@ The Worker does not send user data to any third party other than Telegram (to de
 ### Установка (только панель Cloudflare)
 1. **Создайте хранилище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назовите `air-raid-cache`.
-2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните SQL из раздела [Schema (SQL)](#schema-sql) (создаёт `users`, `cache_kv`, `notified_events`, `device_links`). Это разовое действие — Cloudflare сохранит таблицы после него.
+2. **Создайте таблицы.** Откройте базу D1 → вкладку *Console* и выполните SQL из раздела [Schema (SQL)](#schema-sql_ru) (создаёт `users`, `cache_kv`, `notified_events`, `device_links`). Это разовое действие — Cloudflare сохранит таблицы после него.
 3. **Создайте Worker.** Workers & Pages → *Create* → *Worker* → укажите имя → *Edit code*, замените код по умолчанию содержимым `worker.js`, затем *Deploy*.
 4. **Добавьте биндинги.** Откройте Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: имя переменной `DB`, база `air-raid-cache`.
@@ -133,13 +133,13 @@ The Worker does not send user data to any third party other than Telegram (to de
 6. **Добавьте cron-триггер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → добавьте `* * * * *`.
 7. **Зарегистрируйте вебхук Telegram.** Откройте `https://<ваш-worker>/admin`, войдите с `ADMIN_TOKEN` и выполните действие *Setup webhook*. (Или откройте `https://<ваш-worker>/setup-webhook` после входа.)
 
-> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому убедитесь, что `database_id` в `wrangler.toml` совпадает с вашей базой D1. Для этого тоже не нужен Node.js на вашем компьютере. Подробнее — [wrangler.toml](#wranglertoml).
+> **Необязательно: деплой из Git-репозитория.** В репозитории есть `wrangler.toml`, он описывает биндинги, cron-триггер и переменные. Если подключить репозиторий к Workers Builds, Cloudflare читает этот файл при каждом пуше, поэтому убедитесь, что `database_id` в `wrangler.toml` совпадает с вашей базой D1. Для этого тоже не нужен Node.js на вашем компьютере. Подробнее — [wrangler.toml](#wrangler_ru).
 
 ### Если новые пользователи не сохраняются, а плагин не подключается
 «Вход» в плагине требует, чтобы Telegram-команда `/start <device_id>` дошла до Worker и создала строку в `device_links`. Если этот шаг сломан, `/register` для нового чата возвращает `403 missing device link`, и в `users` ничего не пишется (старые пользователи продолжают работать — у них уже есть `chat_id` и `sync_token`).
 
 Проверяйте по порядку:
-1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, откройте `/admin` → *Инициализировать D1* (воркер выполнит тот же DDL) или выполните SQL из раздела [Schema (SQL)](#schema-sql).
+1. `GET /health` — `db.ok` должен быть `true`, а `db.missing` пустым. Если там `device_links`/`notified_events`, откройте `/admin` → *Инициализировать D1* (воркер выполнит тот же DDL) или выполните SQL из раздела [Schema (SQL)](#schema-sql_ru).
 2. `GET /webhook-info` (под админом) — URL должен быть `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не должен расти, а `last_error_message` должен быть пустым. `401 Unauthorized` означает, что вебхук зарегистрирован без того `secret_token`, который ждёт Worker: откройте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, ответы `database_unavailable`/`database_write_failed` указывают на отсутствующую таблицу или колонку в `users`.
 4. Worker теперь сам лечит рассинхрон вебхука: на первом апдейте, отклонённом из-за неверного секрета, он перерегистрирует вебхук с правильным секретом и отвечает 401, чтобы Telegram повторил доставку.
@@ -217,7 +217,7 @@ Worker не передаёт пользовательские данные ни�
 ### Встановлення (лише панель Cloudflare)
 1. **Створіть сховище.**
    - Storage & Databases → D1 SQL Database → *Create database*, назвіть `air-raid-cache`.
-2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте SQL з розділу [Schema (SQL)](#schema-sql) (створює `users`, `cache_kv`, `notified_events`, `device_links`). Це одноразова дія — Cloudflare збереже таблиці після неї.
+2. **Створіть таблиці.** Відкрийте базу D1 → вкладку *Console* і виконайте SQL з розділу [Schema (SQL)](#schema-sql_uk) (створює `users`, `cache_kv`, `notified_events`, `device_links`). Це одноразова дія — Cloudflare збереже таблиці після неї.
 3. **Створіть Worker.** Workers & Pages → *Create* → *Worker* → вкажіть назву → *Edit code*, замініть код за замовчуванням вмістом `worker.js`, потім *Deploy*.
 4. **Додайте біндинги.** Відкрийте Worker → *Settings* → *Bindings* → *Add*:
    - D1 database: назва змінної `DB`, база `air-raid-cache`.
@@ -229,13 +229,13 @@ Worker не передаёт пользовательские данные ни�
 6. **Додайте cron-тригер.** Worker → *Settings* → *Triggers* → *Cron Triggers* → додайте `* * * * *`.
 7. **Зареєструйте вебхук Telegram.** Відкрийте `https://<ваш-worker>/admin`, увійдіть з `ADMIN_TOKEN` і виконайте дію *Setup webhook*. (Або відкрийте `https://<ваш-worker>/setup-webhook` після входу.)
 
-> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому переконайтеся, що `database_id` у `wrangler.toml` збігається з вашою базою D1. Для цього також не потрібен Node.js на вашому комп'ютері. Детальніше — [wrangler.toml](#wranglertoml).
+> **Необов'язково: деплой з Git-репозиторію.** У репозиторії є `wrangler.toml`, він описує біндинги, cron-тригер і змінні. Якщо підключити репозиторій до Workers Builds, Cloudflare читатиме цей файл при кожному пуші, тому переконайтеся, що `database_id` у `wrangler.toml` збігається з вашою базою D1. Для цього також не потрібен Node.js на вашому комп'ютері. Детальніше — [wrangler.toml](#wrangler_uk).
 
 ### Якщо нові користувачі не зберігаються, а плагін не підключається
 «Вхід» у плагіні вимагає, щоб команда Telegram `/start <device_id>` дійшла до Worker і створила рядок у `device_links`. Якщо цей крок зламано, `/register` для нового чату повертає `403 missing device link`, і в `users` нічого не записується (старі користувачі працюють далі — у них уже є `chat_id` і `sync_token`).
 
 Перевіряйте по порядку:
-1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, відкрийте `/admin` → *Ініціалізувати D1* (воркер виконає той самий DDL) або виконайте SQL з розділу [Schema (SQL)](#schema-sql).
+1. `GET /health` — `db.ok` має бути `true`, а `db.missing` порожнім. Якщо там `device_links`/`notified_events`, відкрийте `/admin` → *Ініціалізувати D1* (воркер виконає той самий DDL) або виконайте SQL з розділу [Schema (SQL)](#schema-sql_uk).
 2. `GET /webhook-info` (під адміном) — URL має бути `https://<ваш-worker>/telegram/webhook`, `pending_update_count` не має зростати, а `last_error_message` — бути порожнім. `401 Unauthorized` означає, що вебхук зареєстровано без того `secret_token`, який очікує Worker: відкрийте `/admin` → *Setup webhook*.
 3. Логи Worker — `[device] write error`, `[user] write error`, відповіді `database_unavailable`/`database_write_failed` вказують на відсутню таблицю або колонку в `users`.
 4. Worker тепер сам лікує розсинхрон вебхука: на першому апдейті, відхиленому через неправильний секрет, він перереєструє вебхук із правильним секретом і відповідає 401, щоб Telegram повторив доставку.
@@ -294,6 +294,9 @@ Worker не передає користувацькі дані нікому, к�
 
 ## wrangler.toml
 
+<a id="wrangler_en"></a>
+### English
+
 Only used for Git-based deploys (Workers Builds). The file itself is comment-free; what each part is for:
 
 - `keep_vars = true` — **required**: without it `wrangler` may wipe the variables and secrets set in the dashboard (`BOT_TOKEN`, `ALERTS_API_KEY`, `ADMIN_TOKEN`, `WEBHOOK_SECRET`).
@@ -303,8 +306,33 @@ Only used for Git-based deploys (Workers Builds). The file itself is comment-fre
 - `[[migrations]]` — `AlertTicker` is a SQLite-backed Durable Object (available on the free plan); the `v1` migration is applied automatically by `wrangler deploy`, including Workers Builds.
 - `[vars]` — plain, non-secret variables (here `ENVIRONMENT = "production"`).
 
+<a id="wrangler_ru"></a>
+### Русский
+
+Используется только при деплое из Git (Workers Builds). Сам файл без комментариев; за что отвечает каждая часть:
+
+- `keep_vars = true` — **обязательно**: без него `wrangler` может стереть переменные и секреты, заданные в Dashboard (`BOT_TOKEN`, `ALERTS_API_KEY`, `ADMIN_TOKEN`, `WEBHOOK_SECRET`).
+- `database_name` — только читаемая метка; базу привязывает `database_id`.
+- `[triggers] crons = ["* * * * *"]` — минутный cron работает только как сторож: он (пере)запускает alarm-цикл Durable Object, который опрашивает каждые несколько секунд, чтобы тревоги приходили быстро.
+- `[[durable_objects.bindings]]` — `TICKER` это биндинг, через который воркер обращается к этому циклу (`AlertTicker`).
+- `[[migrations]]` — `AlertTicker` это Durable Object на SQLite (доступен на бесплатном плане); миграция `v1` применяется автоматически при `wrangler deploy`, включая Workers Builds.
+- `[vars]` — обычные несекретные переменные (здесь `ENVIRONMENT = "production"`).
+
+<a id="wrangler_uk"></a>
+### Українська
+
+Використовується лише під час деплою з Git (Workers Builds). Сам файл без коментарів; за що відповідає кожна частина:
+
+- `keep_vars = true` — **обов'язково**: без нього `wrangler` може стерти змінні та секрети, задані в Dashboard (`BOT_TOKEN`, `ALERTS_API_KEY`, `ADMIN_TOKEN`, `WEBHOOK_SECRET`).
+- `database_name` — лише читабельна мітка; базу прив'язує `database_id`.
+- `[triggers] crons = ["* * * * *"]` — хвилинний cron працює лише як сторож: він (пере)запускає alarm-цикл Durable Object, який опитує кожні кілька секунд, щоб тривоги надходили швидко.
+- `[[durable_objects.bindings]]` — `TICKER` це біндинг, через який воркер звертається до цього циклу (`AlertTicker`).
+- `[[migrations]]` — `AlertTicker` це Durable Object на SQLite (доступний на безкоштовному плані); міграція `v1` застосовується автоматично під час `wrangler deploy`, включно з Workers Builds.
+- `[vars]` — звичайні несекретні змінні (тут `ENVIRONMENT = "production"`).
+
 ## Schema (SQL)
 
+<a id="schema-sql_en"></a>
 ### English
 
 One-time D1 setup. After deploying you can instead open `/admin` → *Инициализировать D1*: the Worker runs the same DDL itself. The script is idempotent, so re-running it is safe.
@@ -380,6 +408,7 @@ CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
 --   ALTER TABLE users ADD COLUMN raw TEXT;
 ```
 
+<a id="schema-sql_ru"></a>
 ### Русский
 
 Разовая настройка D1. После деплоя можно вместо этого открыть `/admin` → *Инициализировать D1*: воркер выполнит тот же DDL сам. Скрипт идемпотентный, повторный запуск безопасен.
@@ -456,6 +485,7 @@ CREATE INDEX IF NOT EXISTS idx_device_links_chat ON device_links (chat_id);
 --   ALTER TABLE users ADD COLUMN raw TEXT;
 ```
 
+<a id="schema-sql_uk"></a>
 ### Українська
 
 Одноразове налаштування D1. Після деплою можна натомість відкрити `/admin` → *Ініціалізувати D1*: воркер виконає той самий DDL сам. Скрипт ідемпотентний, повторний запуск безпечний.
