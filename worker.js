@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.20";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.21";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1042,6 +1042,12 @@ async function deliverUserChanges(env, job, now, lastCheckedAt) {
       user.last_delivery_error = String(reason).slice(0, 200);
       user.last_delivery_error_at = new Date(now).toISOString();
       user.last_delivery_status = res.status || 0;
+      if (res.permanent) {
+        user.notify = false;
+        user.disabled_reason = res.status === 403 ? "bot_blocked" : "unreachable";
+        user.disabled_at = new Date(now).toISOString();
+        console.warn(`[notify] chat ${user.chat_id} unreachable (${reason}); bot notifications disabled`);
+      }
       hadFailures = true;
       continue;
     }
@@ -1916,7 +1922,7 @@ async function buildUsersExportSQL(env, overwrite) {
 }
 
 async function collectUsers(env, data, strict = false) {
-  const st = { total: 0, notifyOff: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, pendingUsers: [], byOblast: {}, truncated: false };
+  const st = { total: 0, notifyOff: 0, blocked: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, pendingUsers: [], byOblast: {}, truncated: false };
   const PAGE_SIZE = 500;
   let offset = 0, pages = 0;
   while (true) {
@@ -1926,7 +1932,7 @@ async function collectUsers(env, data, strict = false) {
       const u = rowToUser(row);
       if (!u) continue;
       st.total++;
-      if (u.notify === false) st.notifyOff++;
+      if (u.notify === false) { st.notifyOff++; if (u.disabled_reason) st.blocked++; }
       const locations = userLocations(u);
       if (!locations.length) { st.noRegion++; continue; }
       if (locations.length > 1) st.multi++;
@@ -2332,7 +2338,7 @@ document.addEventListener("click",function(){var m=$("menu");if(m)m.classList.re
 function bars(obj,total){return Object.keys(obj).map(function(k){var v=obj[k],p=total?Math.round(v*100/total):0;return'<div class="bl"><span>'+esc(k)+'</span><span>'+v+' · '+p+'%</span></div><div class="bar"><i style="width:'+p+'%"></i></div>'}).join("")}
 function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="big">👥</div>Статистика пользователей загружается при полной проверке<br><br><button class="btn f" onclick="load(true)">Проверить</button></div>';
  if(!u.ok)return card("Пользователи",kv("Ошибка",u.error,"bad"));var t=u.stats,tot=t.total-t.noRegion;
- var o='<div class="metrics"><div class="m hl"><div class="v">'+t.total+'</div><div class="l">Всего</div></div><div class="m"><div class="v">'+(t.total-t.notifyOff)+'</div><div class="l">С уведомлениями</div></div><div class="m"><div class="v">'+t.notifyOff+'</div><div class="l">Отключили</div></div><div class="m"><div class="v '+(t.pending?"warn":"")+'">'+t.pending+'</div><div class="l">Ждут доставки</div></div></div>';
+ var o='<div class="metrics"><div class="m hl"><div class="v">'+t.total+'</div><div class="l">Всего</div></div><div class="m"><div class="v">'+(t.total-t.notifyOff)+'</div><div class="l">С уведомлениями</div></div><div class="m"><div class="v">'+t.notifyOff+'</div><div class="l">Отключили'+(t.blocked?' · недоступны: '+t.blocked:'')+'</div></div><div class="m"><div class="v '+(t.pending?"warn":"")+'">'+t.pending+'</div><div class="l">Ждут доставки</div></div></div>';
  if(t.pending){var pu=t.pendingUsers||[];
   var rows=pu.map(function(x){var ch=(x.changes||[]).map(function(c){return c.name+": "+c.from+" → "+c.to}).join("; ");
    if(x.error)ch+=(ch?" · ":"")+"⚠ "+x.error;
