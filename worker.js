@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.19";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.20";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1037,7 +1037,11 @@ async function deliverUserChanges(env, job, now, lastCheckedAt) {
     const res = !claimed ? { ok: true, permanent: false, status: 0 } : await sendTelegramTracked(env, user.chat_id, text);
     if (!res.ok) {
       if (claimed) await releaseNotificationClaim(env.DB, dedupeName);
-      console.error(`[notify] delivery failed for chat ${user.chat_id} (${locationId}), will retry`);
+      const reason = res.description || (res.status ? `HTTP ${res.status}` : "network error");
+      console.error(`[notify] delivery failed for chat ${user.chat_id} (${locationId}): ${reason}, will retry`);
+      user.last_delivery_error = String(reason).slice(0, 200);
+      user.last_delivery_error_at = new Date(now).toISOString();
+      user.last_delivery_status = res.status || 0;
       hadFailures = true;
       continue;
     }
@@ -1954,6 +1958,8 @@ async function collectUsers(env, data, strict = false) {
           chat_id: u.chat_id, lang: normLang(u.lang), locations: locations.length,
           telegram_connected: !!u.telegram_connected,
           last_activity: u.last_activity || null, last_check: u.last_check || null,
+          error: u.last_delivery_error ? String(u.last_delivery_error).slice(0, 120) : null,
+          error_at: u.last_delivery_error_at || null,
           changes
         });
       }
@@ -2329,6 +2335,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  var o='<div class="metrics"><div class="m hl"><div class="v">'+t.total+'</div><div class="l">Всего</div></div><div class="m"><div class="v">'+(t.total-t.notifyOff)+'</div><div class="l">С уведомлениями</div></div><div class="m"><div class="v">'+t.notifyOff+'</div><div class="l">Отключили</div></div><div class="m"><div class="v '+(t.pending?"warn":"")+'">'+t.pending+'</div><div class="l">Ждут доставки</div></div></div>';
  if(t.pending){var pu=t.pendingUsers||[];
   var rows=pu.map(function(x){var ch=(x.changes||[]).map(function(c){return c.name+": "+c.from+" → "+c.to}).join("; ");
+   if(x.error)ch+=(ch?" · ":"")+"⚠ "+x.error;
    return li("👤","warn","#"+x.chat_id,ch||"—",(x.last_activity?tm(x.last_activity):"—")+"<br>"+esc(x.lang||"")+(x.locations>1?" · "+x.locations+" лок.":"")+(x.telegram_connected?"":" · без TG"))}).join("");
   o+=card("Ждут доставки ("+t.pending+")",rows+(t.pending>pu.length?'<div class="empty">Показаны первые '+pu.length+'</div>':"")+'<div class="row" style="margin-top:10px"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Разослать сейчас?\\',\\'Повторит отправку всем, у кого состояние разошлось со снапшотом, и пересчитает очередь.\\')">Разослать сейчас</button></div>');
  }
