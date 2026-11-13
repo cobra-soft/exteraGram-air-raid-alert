@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.21";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.22";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2191,8 +2191,6 @@ body{margin:0;background:var(--app-bg);background-attachment:fixed;color:var(--t
 .tag{padding:2px 10px;border-radius:8px;font-size:12px;font-weight:500}.tag.red{background:var(--errc);color:var(--err)}.tag.yellow{background:var(--warnc);color:var(--warn)}
 .empty{text-align:center;color:var(--tv);padding:32px 8px}.empty .big{font-size:40px}
 pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospace,Menlo,monospace;color:var(--tv);max-height:360px;overflow:auto}
-.fab{position:fixed;right:16px;bottom:24px;height:44px;padding:0 16px 0 12px;border-radius:12px;border:0;background:var(--pr);color:var(--onpr);font:600 13px var(--f);display:flex;align-items:center;gap:8px;cursor:pointer;z-index:6}
-.fab svg{width:24px;height:24px;fill:currentColor}
 .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;place-items:center;z-index:20}.scrim.on{display:grid}
 .dlg{background:var(--app-surface);border:1px solid var(--ol);border-radius:28px;padding:24px;width:min(360px,calc(100% - 32px))}.dlg h3{margin:0 0 16px;font:400 24px/32px var(--f)}.dlg p{margin:0 0 24px;color:var(--tv)}.dlg .row{justify-content:flex-end}
 .snack{position:fixed;left:50%;transform:translate(-50%,16px);opacity:0;visibility:hidden;pointer-events:none;bottom:96px;background:#dcdbf0;color:#1d1a42;padding:14px 16px;border-radius:12px;max-width:calc(100% - 32px);z-index:30;box-shadow:0 4px 12px rgba(0,0,0,.4);transition:transform .3s cubic-bezier(.2,0,0,1),opacity .3s ease,visibility 0s .3s}
@@ -2202,12 +2200,12 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospa
 .menu{display:none;position:absolute;right:0;top:44px;background:var(--s3);border-radius:12px;padding:8px 0;min-width:280px;box-shadow:0 4px 16px rgba(0,0,0,.6);z-index:15}.menu.on{display:block}
 .mi{display:flex;gap:12px;padding:12px 16px;cursor:pointer}.mi:hover{background:var(--s3)}.mi span{width:16px;color:var(--pr)}.mi.on{color:var(--pr)}
 @media(max-width:600px){.menu{position:fixed;left:16px;right:16px;top:auto;bottom:100px;min-width:0}}
-@media(min-width:840px){.metrics{grid-template-columns:repeat(4,1fr)}.fab{bottom:24px}.snack{bottom:24px}}
+@media(min-width:840px){.metrics{grid-template-columns:repeat(4,1fr)}.snack{bottom:24px}}
 @media(max-width:839px){.rail{position:fixed;bottom:0;left:0;right:0;top:auto;width:100%;height:80px;flex-direction:row;justify-content:space-around;padding:12px 0 calc(12px + env(safe-area-inset-bottom,0px));background:var(--app-surface);border:0;z-index:10;height:auto;gap:0}
 .ni{width:auto;flex:1;min-width:0}
 .app{padding:0}
 .view{padding:8px 12px calc(160px + env(safe-area-inset-bottom,0px))}
-.fab{bottom:calc(96px + env(safe-area-inset-bottom,0px));right:16px;width:56px;padding:0;justify-content:center}.fab span{display:none}.snack{bottom:calc(170px + env(safe-area-inset-bottom,0px))}.sw b{display:none}}
+.snack{bottom:calc(96px + env(safe-area-inset-bottom,0px))}.sw b{display:none}}
 @media(max-width:600px){
 .top{padding:0 10px;gap:8px}
 .top h1{font:500 16px/20px var(--f)}
@@ -2229,7 +2227,6 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/16px ui-monospa
 .btns{grid-template-columns:1fr}
 pre{max-height:280px;font-size:11px;line-height:15px}
 .dlg{padding:20px;border-radius:22px}.dlg h3{font-size:20px;line-height:26px}
-.fab{width:52px;height:52px;border-radius:16px;right:12px}
 .snack{font-size:13px;padding:12px 14px}
 .menu{left:12px;right:12px}
 }
@@ -2248,7 +2245,6 @@ pre{max-height:280px;font-size:11px;line-height:15px}
 <div class="prog" id="prog"><i></i></div>
 <main class="view" id="view"></main>
 </div></div>
-<button class="fab" id="fab" title="Полная проверка" aria-label="Полная проверка"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg><span>Полная проверка</span></button>
 <div class="scrim" id="scrim"><div class="dlg"><h3 id="dt"></h3><p id="dp"></p><div class="row"><button class="btn t" id="dn">Отмена</button><button class="btn f" id="dy">Выполнить</button></div></div></div>
 <div class="snack" id="snack"></div>
 <script>
@@ -2286,7 +2282,7 @@ function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.ra
  if(d.maintenance&&d.maintenance.active){o+='<div class="hero card warn"><div class="ic">🛠</div><div><b>Технические работы</b><span>'+esc(d.maintenance.message||"Рассылка уведомлений приостановлена")+' · с '+dtm(d.maintenance.since)+'</span></div></div>'}
  o+='<div class="hero card '+h.lvl+'"><div class="ic">'+T[0]+'</div><div><b>'+T[1]+'</b><span>'+esc(h.is.length?h.is.join(" · "):T[2])+'</span></div></div>';
  o+='<div class="metrics"><div class="m'+(n?' hl':'')+'"><div class="v">'+n+'</div><div class="l">Активных тревог</div></div>'
-  +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
+  +'<div class="m"><div class="v '+(s?(s.ageSeconds>2100?"bad":""):"bad")+'" id="snapAge" data-at="'+(s&&s.fetchedAt?s.fetchedAt:0)+'" data-sev="1">'+(s?age(s.ageSeconds):"—")+'</div><div class="l">Возраст снапшота</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.total:"—")+'</div><div class="l">Пользователей</div></div>'
   +'<div class="m"><div class="v">'+(f.users&&f.users.ok?f.users.stats.pending:"—")+'</div><div class="l">Ждут доставки</div></div></div>';
  var u=f.upstream,w=f.webhook,c=d.cron,L="";
@@ -2358,7 +2354,7 @@ function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false}
    +'<button class="btn t" onclick="ask(\\'maintenance-resend\\',\\'Повторить рассылку?\\',\\'Отправит уведомление о текущем режиме тех. работ всем пользователям ещё раз.\\')">Повторить рассылку</button></div>');
  o+=card("Действия",'<div class="sh">Проверки</div><div class="btns"><button class="btn" onclick="load(true)">Полная проверка</button><button class="btn" onclick="load(true,false,false,true)">Проверить alerts.in.ua</button><button class="btn" onclick="load(true,true)">Тест записи D1</button></div><div class="sh">Обслуживание</div><div class="btns"><button class="btn o" onclick="ask(\\'init-schema\\',\\'Создать недостающие таблицы D1?\\',\\'Выполнит CREATE TABLE IF NOT EXISTS для users, cache_kv, notified_events, device_links. Существующие таблицы и данные не изменяются.\\')">Инициализировать D1</button><button class="btn o" onclick="ask(\\'setup-webhook\\',\\'Установить webhook?\\',\\'Выполнится setWebhook с drop_pending_updates=true — очередь ожидающих апдейтов будет очищена.\\')">Setup webhook</button><button class="btn o" onclick="ask(\\'purge-edge\\',\\'Сбросить кэш /api?\\',\\'Следующий запрос плагина пойдёт в D1/upstream.\\')">Сбросить кэш /api</button></div><div class="sh">Рассылка и данные</div><div class="btns"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Досинхронизировать рассылку?\\',\\'Разошлёт сообщения всем, у кого сохранённое состояние разошлось с текущим снапшотом, не дожидаясь нового изменения тревог.\\')">Досинхронизировать рассылку</button><a class="btn" style="display:inline-flex;align-items:center;justify-content:center;text-decoration:none" href="/admin/export/users.sql?overwrite=1">Скачать users.sql</a></div>');
  o+=card("Воркер",kv("Версия",d.version)+kv("Языки",d.langs.join(", "))+kv("Время",dtm(d.time))+kv("Edge TTL /api",d.config.edgeTtl+" с")+kv("Мин. интервал записи D1",d.config.cacheWriteIntervalSec+" с")+kv("Окно ретраев",d.config.retryWindowSec+" с"));
- if(s)o+=card("Снапшот",kv("Возраст",age(s.ageSeconds),s.ageSeconds>2100?"bad":"ok")+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
+ if(s)o+=card("Снапшот",'<div class="kv"><span>Возраст</span><span class="'+(s.ageSeconds>2100?"bad":"ok")+'" id="snapAgeSv" data-at="'+(s.fetchedAt||0)+'" data-sev="1">'+age(s.ageSeconds)+'</span></div>'+kv("Обновлено",dtm(s.fetchedAt))+kv("Областей / районов",s.oblasts.length+" / "+s.raions.length)+kv("pendingRetry",s.pendingRetry?dtm(s.pendingRetry):"нет",s.pendingRetry?"warn":"ok")+kv("Подпись",(s.signature||"").slice(0,60)+((s.signature||"").length>60?"…":"")));
  var u=f.upstream;if(u)o+=card("alerts.in.ua (live)",kv("Статус",u.ok?"OK":(u.rateLimited?"Лимит (429)":"Ошибка"),u.ok?"ok":(u.rateLimited?"warn":"bad"))+kv("Ответ",u.ms+" мс")+(u.ok?kv("Сырых alerts",u.rawAlerts)+kv("Области / районы",u.oblasts+" / "+u.raions)+kv("Совпадает со снапшотом",u.sameAsSnapshot==null?"—":u.sameAsSnapshot?"да":"нет",u.sameAsSnapshot===false?"warn":"ok"):kv("Ошибка",u.error,"bad")));
  var w=f.webhook;if(w){var i=w.info||{};o+=card("Telegram webhook",w.ok?kv("URL",i.url||"не задан",i.url?"":"bad")+kv("В очереди",i.pending_update_count,i.pending_update_count>0?"warn":"ok")+kv("Последняя ошибка",i.last_error_message||"нет",i.last_error_message?"bad":"ok")+kv("Когда",i.last_error_date?dtm(i.last_error_date*1000):"—")+kv("Макс. соединений",i.max_connections)+kv("Ответ",w.ms+" мс"):kv("Ошибка",w.error,"bad"))}
  if(f.kvWrite)o+=card("Тест записи D1",kv("Результат",f.kvWrite.ok?"OK · "+f.kvWrite.ms+" мс":f.kvWrite.error,f.kvWrite.ok?"ok":"bad"));
@@ -2378,9 +2374,10 @@ function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").cl
  $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){var msg=j.ok?"успешно":JSON.stringify(j).slice(0,120);if(name==="resync-notify"&&j.ok)msg="готово: ждали "+j.pendingBefore+" → осталось "+j.pendingAfter+(j.hadFailures?" (есть сбои доставки, см. логи)":"");snack(name+": "+msg);load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
 $("dn").onclick=function(){$("scrim").classList.remove("on")};
 $("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
-$("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};$("fab").onclick=function(){load(true)};
+$("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};
 $("auto").onclick=function(){S.auto=!S.auto;this.classList.toggle("on",S.auto)};
 nav();draw();load(true,false,true);setInterval(function(){if(S.auto&&!document.hidden)load(false)},30000);
+setInterval(function(){var els=document.querySelectorAll("[data-at]");for(var i=0;i<els.length;i++){var at=Number(els[i].getAttribute("data-at"));if(!at)continue;var a=Math.max(0,Math.round((Date.now()-at)/1000));els[i].textContent=age(a);if(els[i].getAttribute("data-sev"))els[i].classList.toggle("bad",a>2100)}},1000);
 </script></body></html>`;
 
 export default {
