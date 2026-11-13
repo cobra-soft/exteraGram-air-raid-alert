@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.22";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.23";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1978,7 +1978,7 @@ async function collectUsers(env, data, strict = false) {
   return st;
 }
 
-async function adminData(env, request, full, kvTest, probeUp) {
+async function adminData(env, request, full, kvTest, probeUp, usersOnly) {
   const out = {
     version: WORKER_VERSION, time: new Date().toISOString(), langs: Object.keys(TEXTS),
     bindings: { alertsKey: !!env.ALERTS_API_KEY, botToken: !!env.BOT_TOKEN, db: !!env.DB },
@@ -1999,6 +1999,15 @@ async function adminData(env, request, full, kvTest, probeUp) {
     const u = new URL(request.url); u.pathname = "/api"; u.search = "";
     out.edgeCache = !!(await caches.default.match(new Request(u.toString(), { method: "GET" })));
   } catch (e) { out.edgeCache = null; }
+  if (usersOnly) {
+    try {
+      out.users = c && c.data
+        ? { ok: true, ms: 0, stats: await collectUsers(env, c.data) }
+        : { ok: false, error: "нет снапшота в D1" };
+    } catch (e) { out.users = { ok: false, error: String(e && e.message || e).slice(0, 300) }; }
+    if (out.snapshot) { delete out.snapshot.oblasts; delete out.snapshot.raions; }
+    return out;
+  }
   if (!full) return out;
 
   const timed = async (fn) => { const t = Date.now(); try { return { ok: true, ms: 0, ...(await fn()), _t: t }; } catch (e) { return { ok: false, error: String(e && e.message || e).slice(0, 300), rateLimited: !!(e && e.status === 429), _t: t }; } };
@@ -2069,7 +2078,7 @@ async function handleAdmin(request, env, url, ctx) {
     "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"
   } });
   if (p === "/admin/data") {
-    try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1", url.searchParams.get("up") === "1")); }
+    try { return adminJson(await adminData(env, request, url.searchParams.get("full") === "1", url.searchParams.get("kv") === "1", url.searchParams.get("up") === "1", url.searchParams.get("users") === "1")); }
     catch (e) { return adminJson({ error: String(e) }, 500); }
   }
   if (p === "/admin/export/users.sql") {
@@ -2240,7 +2249,7 @@ pre{max-height:280px;font-size:11px;line-height:15px}
 <div class="app">
 <nav class="rail" id="nav"></nav>
 <div class="main">
-<header class="top"><h1>Air Raid Worker<small id="sub"></small></h1><div class="sw on" id="auto" title="Автообновление 30с"><b>Авто</b><i></i></div>
+<header class="top"><h1>Air Raid Worker<small id="sub"></small></h1><div class="sw on" id="auto" title="Автообновление 5с"><b>Авто</b><i></i></div>
 <button class="ib" id="rf" title="Обновить"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button><button class="ib" id="lo" title="Выйти"><svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button></header>
 <div class="prog" id="prog"><i></i></div>
 <main class="view" id="view"></main>
@@ -2370,13 +2379,15 @@ function load(full,kv,quiet,up){busy(1);
  fetch("/admin/data"+(full?"?full=1"+(kv?"&kv=1":"")+(up?"&up=1":""):""),{cache:"no-store"}).then(function(r){if(r.status===401){location.href="/admin";return}return r.json()}).then(function(d){if(!d)return;
   if(full)["upstream","webhook","users","kvWrite"].forEach(function(k){if(d[k])S.f[k]=d[k]});
   S.d=d;draw();if(full&&!quiet)snack("Полная проверка завершена")}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}
+function loadUsers(){fetch("/admin/data?users=1",{cache:"no-store"}).then(function(r){if(r.status===401){location.href="/admin";return}return r.json()}).then(function(d){if(!d||!d.users)return;S.f.users=d.users;draw()}).catch(function(){})}
 function ask(name,t,p){$("dt").textContent=t;$("dp").textContent=p;$("scrim").classList.add("on");
  $("dy").onclick=function(){$("scrim").classList.remove("on");busy(1);fetch("/admin/action?name="+name,{method:"POST"}).then(function(r){return r.json()}).then(function(j){var msg=j.ok?"успешно":JSON.stringify(j).slice(0,120);if(name==="resync-notify"&&j.ok)msg="готово: ждали "+j.pendingBefore+" → осталось "+j.pendingAfter+(j.hadFailures?" (есть сбои доставки, см. логи)":"");snack(name+": "+msg);load(true,false,true)}).catch(function(e){snack("Ошибка: "+e)}).then(function(){busy(-1)})}}
 $("dn").onclick=function(){$("scrim").classList.remove("on")};
 $("scrim").onclick=function(e){if(e.target===this)this.classList.remove("on")};
 $("rf").onclick=function(){load(false)};$("lo").onclick=function(){fetch("/admin/logout",{method:"POST"}).then(function(){location.href="/admin"})};
 $("auto").onclick=function(){S.auto=!S.auto;this.classList.toggle("on",S.auto)};
-nav();draw();load(true,false,true);setInterval(function(){if(S.auto&&!document.hidden)load(false)},30000);
+nav();draw();load(true,false,true);setInterval(function(){if(S.auto&&!document.hidden)load(false)},5000);
+setInterval(function(){if(S.auto&&!document.hidden)loadUsers()},10000);
 setInterval(function(){var els=document.querySelectorAll("[data-at]");for(var i=0;i<els.length;i++){var at=Number(els[i].getAttribute("data-at"));if(!at)continue;var a=Math.max(0,Math.round((Date.now()-at)/1000));els[i].textContent=age(a);if(els[i].getAttribute("data-sev"))els[i].classList.toggle("bad",a>2100)}},1000);
 </script></body></html>`;
 
