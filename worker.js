@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.18";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.19";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -1912,7 +1912,7 @@ async function buildUsersExportSQL(env, overwrite) {
 }
 
 async function collectUsers(env, data, strict = false) {
-  const st = { total: 0, notifyOff: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, byOblast: {}, truncated: false };
+  const st = { total: 0, notifyOff: 0, noRegion: 0, multi: 0, byLang: {}, byState: {}, pending: 0, pendingUsers: [], byOblast: {}, truncated: false };
   const PAGE_SIZE = 500;
   let offset = 0, pages = 0;
   while (true) {
@@ -1930,6 +1930,7 @@ async function collectUsers(env, data, strict = false) {
       st.byLang[lang] = (st.byLang[lang] || 0) + 1;
       let pending = false;
       let worst = "clear";
+      const changes = [];
       for (const location of locations) {
         const knownState = u.location_states && u.location_states[locationKey(location)];
         const known = knownState && knownState.state
@@ -1937,11 +1938,25 @@ async function collectUsers(env, data, strict = false) {
           : (locations.length === 1 ? (u.last_alert_state || "clear") : "clear");
         if (known === "red") worst = "red";
         else if (known === "yellow" && worst !== "red") worst = "yellow";
-        if (data && u.notify !== false && alertStatus(data, location.oblast_key, location.district_key).state !== known) pending = true;
+        if (data && u.notify !== false) {
+          const nowState = alertStatus(data, location.oblast_key, location.district_key).state;
+          if (nowState !== known) {
+            pending = true;
+            changes.push({ name: defaultLocationName(location.oblast_key, location.district_key), from: known, to: nowState });
+          }
+        }
       }
       st.byState[worst] = (st.byState[worst] || 0) + 1;
       st.byOblast[locations[0].oblast_key] = (st.byOblast[locations[0].oblast_key] || 0) + 1;
-      if (pending) st.pending++;
+      if (pending) {
+        st.pending++;
+        if (st.pendingUsers.length < 20) st.pendingUsers.push({
+          chat_id: u.chat_id, lang: normLang(u.lang), locations: locations.length,
+          telegram_connected: !!u.telegram_connected,
+          last_activity: u.last_activity || null, last_check: u.last_check || null,
+          changes
+        });
+      }
     }
     offset += rows.length;
     if (rows.length < PAGE_SIZE) break;
@@ -2312,6 +2327,11 @@ function bars(obj,total){return Object.keys(obj).map(function(k){var v=obj[k],p=
 function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="big">👥</div>Статистика пользователей загружается при полной проверке<br><br><button class="btn f" onclick="load(true)">Проверить</button></div>';
  if(!u.ok)return card("Пользователи",kv("Ошибка",u.error,"bad"));var t=u.stats,tot=t.total-t.noRegion;
  var o='<div class="metrics"><div class="m hl"><div class="v">'+t.total+'</div><div class="l">Всего</div></div><div class="m"><div class="v">'+(t.total-t.notifyOff)+'</div><div class="l">С уведомлениями</div></div><div class="m"><div class="v">'+t.notifyOff+'</div><div class="l">Отключили</div></div><div class="m"><div class="v '+(t.pending?"warn":"")+'">'+t.pending+'</div><div class="l">Ждут доставки</div></div></div>';
+ if(t.pending){var pu=t.pendingUsers||[];
+  var rows=pu.map(function(x){var ch=(x.changes||[]).map(function(c){return c.name+": "+c.from+" → "+c.to}).join("; ");
+   return li("👤","warn","#"+x.chat_id,ch||"—",(x.last_activity?tm(x.last_activity):"—")+"<br>"+esc(x.lang||"")+(x.locations>1?" · "+x.locations+" лок.":"")+(x.telegram_connected?"":" · без TG"))}).join("");
+  o+=card("Ждут доставки ("+t.pending+")",rows+(t.pending>pu.length?'<div class="empty">Показаны первые '+pu.length+'</div>':"")+'<div class="row" style="margin-top:10px"><button class="btn o" onclick="ask(\\'resync-notify\\',\\'Разослать сейчас?\\',\\'Повторит отправку всем, у кого состояние разошлось со снапшотом, и пересчитает очередь.\\')">Разослать сейчас</button></div>');
+ }
  o+=card("Языки",bars(t.byLang,tot));
  o+=card("Состояние (last_alert_state)",bars(t.byState,tot));
  o+=card("Топ областей",t.byOblast.map(function(x){var p=tot?Math.round(x.n*100/tot):0;return'<div class="bl"><span>'+esc(x.name)+'</span><span>'+x.n+'</span></div><div class="bar"><i style="width:'+Math.min(100,p*3)+'%"></i></div>'}).join("")||'<div class="empty">Нет данных</div>');
