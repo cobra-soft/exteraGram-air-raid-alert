@@ -4,7 +4,7 @@ const ALERTS_API = "https://api.alerts.in.ua/v1/alerts/active.json";
 const TELEGRAM_API = "https://api.telegram.org/bot";
 const FETCH_TIMEOUT_MS = 5000;
 const EDGE_CACHE_TTL_SECONDS = 5;
-const WORKER_VERSION = "air-raid-panel-2026-11-12.17";
+const WORKER_VERSION = "air-raid-panel-2026-11-12.18";
 const SEND_CONCURRENCY = 15;
 const MIN_CACHE_WRITE_INTERVAL_SECONDS = 60;
 const RETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -2234,6 +2234,7 @@ function tm(x){return x?new Date(x).toLocaleTimeString("ru-RU",{timeZone:TZ,hour
 function dtm(x){return x?new Date(x).toLocaleString("ru-RU",{timeZone:TZ}):"—"}
 function age(s){if(s==null)return"—";if(s<90)return s+" с";if(s<5400)return Math.round(s/60)+" мин";return(s/3600).toFixed(1)+" ч"}
 function dur(x){if(!x)return"—";var m=Math.max(0,Math.round((Date.now()-new Date(x))/60000));if(m<60)return m+" мин";var t=Math.floor(m/60);if(t<48)return t+" ч "+(m%60)+" мин";var d=Math.floor(t/24);return d+" дн "+(t%24)+" ч"}
+function plural(n,a,b,c){n=Math.abs(n)%100;var d=n%10;if(n>10&&n<20)return c;if(d===1)return a;if(d>=2&&d<=4)return b;return c}
 function kv(k,v,c){return'<div class="kv"><span>'+esc(k)+'</span><span class="'+(c||"")+'">'+(v==null||v===""?"—":esc(v))+'</span></div>'}
 function li(ic,cls,t,s,e,go){return'<div class="li"'+(go?' style="cursor:pointer" onclick="tab(\\''+go+'\\')"':'')+'><div class="av '+cls+'">'+ic+'</div><div class="t"><b>'+esc(t)+'</b><span>'+esc(s)+'</span></div><div class="e">'+(e||"")+'</div></div>'}
 function card(t,b){return'<div class="card"><h2>'+esc(t)+'</h2>'+b+'</div>'}
@@ -2249,7 +2250,7 @@ function health(){var d=S.d,f=S.f,is=[],lvl="ok";
  if(f.upstream&&!f.upstream.ok&&!f.upstream.rateLimited)bad("alerts.in.ua: "+f.upstream.error);
   if(d.cron&&d.cron.state==="fail"&&Date.now()-d.cron.lastAt<900000)wr("Cron: сбой опроса alerts.in.ua с "+dtm(d.cron.since)+" ("+d.cron.error+")");
  if(f.webhook){if(!f.webhook.ok)wr("Webhook: "+f.webhook.error);else if(!f.webhook.info.url)bad("Webhook не установлен");else if(whErr(f.webhook))wr("Webhook: "+whErr(f.webhook))}
- if(f.users&&f.users.ok&&f.users.stats.pending)wr(f.users.stats.pending+" пользователей ждут доставки");
+ if(f.users&&f.users.ok&&f.users.stats.pending)wr(f.users.stats.pending+" "+plural(f.users.stats.pending,"пользователь ждёт","пользователя ждут","пользователей ждут")+" доставки");
  if(f.kvWrite&&!f.kvWrite.ok)bad("Запись в D1 не работает: "+f.kvWrite.error);
  return{lvl:lvl,is:is}}
 function vOv(){var d=S.d,f=S.f,s=d.snapshot,h=health(),n=s?s.oblasts.length+s.raions.length:0;
@@ -2317,7 +2318,7 @@ function vUs(){var u=S.f.users;if(!u)return'<div class="card empty"><div class="
  o+=card("Прочее",kv("Без региона",t.noRegion)+(t.truncated?kv("Внимание","список обрезан (10 страниц)","warn"):"")+kv("Время проверки",u.ms+" мс"));return o}
 function vSy(){var d=S.d,f=S.f,s=d.snapshot,o="",m=d.maintenance||{active:false};
  var mb=d.maintenanceBroadcast,bLine="";
- if(mb){var bstat=mb.status==="done"?"готово":(mb.status==="running"?"идёт":"в очереди");bLine=kv("Рассылка",bstat+" · отправлено "+(mb.sent||0)+(mb.failed?" · ошибок "+mb.failed:"")+(mb.error?" · "+mb.error:""),mb.error?"bad":(mb.status==="done"?"ok":"warn"));}
+ if(mb){var bstat=mb.status==="done"?"готово":(mb.status==="running"?"идёт":"в очереди");bLine=kv("Рассылка",bstat+" · отправлено "+(mb.sent||0)+(mb.failed?" · "+mb.failed+" "+plural(mb.failed,"ошибка","ошибки","ошибок"):"")+(mb.error?" · "+mb.error:""),mb.error?"bad":(mb.status==="done"?"ok":"warn"));}
  o+=card("Технические работы",(m.active?kv("Статус","включены с "+dtm(m.since),"warn")+kv("Сообщение",m.message||"—"):kv("Статус","выключены","ok"))+bLine+'<div class="row" style="margin-top:12px;flex-wrap:wrap">'
    +'<button class="btn f" '+(m.active?"disabled":"")+' onclick="ask(\\'maintenance-on\\',\\'Начать технические работы?\\',\\'Рассылка Telegram-уведомлений будет приостановлена до завершения работ. Плагины увидят флаг maintenance в /api.\\')">Начать тех. работы</button>'
    +'<button class="btn o" '+(!m.active?"disabled":"")+' onclick="ask(\\'maintenance-off\\',\\'Завершить технические работы?\\',\\'Рассылка уведомлений возобновится на следующем тике cron (раз в минуту).\\')">Завершить тех. работы</button>'
